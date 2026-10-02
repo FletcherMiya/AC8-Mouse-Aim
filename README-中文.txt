@@ -11,3 +11,4 @@ cmd /d /c "set EOS_USE_ANTICHEATCLIENTNULL=1&& %command% -anticheat_settings=AC8
 
 卸载方式：
 1. 双击Quick-Uninstall.cmd
+2. 去掉steam属性中的启动项参数
