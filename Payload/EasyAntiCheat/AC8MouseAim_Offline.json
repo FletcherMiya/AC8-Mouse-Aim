@@ -1,0 +1,12 @@
+{
+  "title": "ACE COMBAT 8",
+  "executable": "Game/Binaries/Win64/AceCombat8.exe",
+  "productid": "49f9e9c885e34da0915799c5178cd297",
+  "sandboxid": "ae809f063dbd4f869f966534e145195b",
+  "deploymentid": "a27e22e9c95e40f0abde43e10b68ae2d",
+  "requested_splash": "EasyAntiCheat/SplashScreen.png",
+  "wait_for_game_process_exit": "false",
+  "hide_bootstrapper": "false",
+  "hide_gui": "false",
+  "allow_null_client": "true"
+}
