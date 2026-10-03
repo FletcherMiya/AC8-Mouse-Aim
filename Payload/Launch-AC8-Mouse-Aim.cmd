@@ -8,10 +8,18 @@ if not errorlevel 1 (
   exit /b 1
 )
 if exist "Game\Binaries\Win64\dwmapi.dll.disabled" (
+  if exist "Game\Binaries\Win64\dwmapi.dll" (
+    echo Both loader files exist. Resolve this manually; nothing was replaced.
+    pause
+    exit /b 1
+  )
+  echo This enables shared UE4SS and all other enabled mods using this loader.
+  choice /C YN /N /M "Enable the shared loader? [Y/N] "
+  if errorlevel 2 exit /b 0
   move /y "Game\Binaries\Win64\dwmapi.dll.disabled" "Game\Binaries\Win64\dwmapi.dll" >nul
 )
 if not exist "Game\Binaries\Win64\dwmapi.dll" (
-  echo The UE4SS loader is missing. Re-run Install.cmd.
+  echo No supported dwmapi loader found. If you use a custom loader, use its existing Steam startup workflow.
   pause
   exit /b 1
 )
