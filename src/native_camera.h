@@ -6,12 +6,13 @@ struct CameraCommand { uintptr_t manager=0,pawn=0; double p=0,y=0,r=0; ULONGLONG
 std::mutex camera_command_mutex;
 CameraCommand camera_command;
 bool native_camera_fault=false;
-void receive_camera(const char* line) {
-    unsigned long long manager=0,pawn=0; double p=0,y=0,r=0;
-    if(sscanf_s(line,"CAMERA %llx %llx %lf %lf %lf",&manager,&pawn,&p,&y,&r)!=5) return;
-    if(!std::isfinite(p)||!std::isfinite(y)||!std::isfinite(r)) return;
-    std::lock_guard<std::mutex> lock(camera_command_mutex);
-    camera_command={static_cast<uintptr_t>(manager),static_cast<uintptr_t>(pawn),p,y,r,GetTickCount64()};
+// Single game-thread publisher; try-lock also makes an unexpected concurrent
+// callback nonblocking. Old commands still expire at the original 250ms limit.
+bool receive_camera(uintptr_t manager,uintptr_t pawn,double p,double y,double r) {
+    std::unique_lock<std::mutex> lock(camera_command_mutex,std::try_to_lock);
+    if(!lock.owns_lock()) return false;
+    camera_command={manager,pawn,p,y,r,GetTickCount64()};
+    return true;
 }
 bool apply_native_camera(void* manager,const CameraCommand& cmd) {
     __try {
@@ -34,9 +35,14 @@ bool apply_native_camera(void* manager,const CameraCommand& cmd) {
 }
 void __fastcall update_native_camera(void* manager,float dt) {
     original_camera_update(manager,dt);
+    PerfSpan timing(perf_camera);
     if(native_camera_fault || !running.load() || !active.load() || !enabled.load() || gaze_active.load()) return;
     CameraCommand cmd;
-    { std::lock_guard<std::mutex> lock(camera_command_mutex); cmd=camera_command; }
+    {
+        std::unique_lock<std::mutex> lock(camera_command_mutex,std::try_to_lock);
+        if(!lock.owns_lock()) return;
+        cmd=camera_command;
+    }
     // Report actual ownership interruptions, without relaxing release safeguards.
     // Ignore other camera managers rather than counting them as interruptions.
     if(cmd.manager && reinterpret_cast<uintptr_t>(manager)!=cmd.manager) return;

@@ -16,10 +16,12 @@
 #include <string>
 #include <thread>
 #include <mutex>
+#include <array>
 #include "vendor/minhook/include/MinHook.h"
 #include "yaw_signature.h"
 #include "flight_math.h"
 #include "free_look.h"
+#include "lua_bridge.h"
 
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -82,7 +84,6 @@ std::atomic<float> target_pitch{0}, target_yaw{0};
 std::atomic<float> look_pitch{0}, look_yaw{0};
 flight::FreeLook free_look;
 std::atomic<bool> recenter_requested{true};
-std::atomic<unsigned long long> calls{0}, writes{0};
 float previous_pitch{}, previous_yaw{}, previous_roll{};
 float filtered_pitch_rate{}, filtered_yaw_rate{}, filtered_roll_rate{};
 flight::LevelBlend roll_level_blend;
@@ -92,7 +93,6 @@ wchar_t module_folder[MAX_PATH]{};
 wchar_t status_path[MAX_PATH]{};
 wchar_t config_path[MAX_PATH]{};
 wchar_t request_path[MAX_PATH]{};
-wchar_t pipe_name[] = L"\\\\.\\pipe\\AC8MouseAim";
 HANDLE journal = INVALID_HANDLE_VALUE;
 HWND game_window{};
 HWND overlay_window{};
@@ -117,39 +117,7 @@ void init_paths() {
     swprintf_s(request_path, L"%s\\mouse-aim-request.txt", module_folder);
 }
 
-void log_line(const char* format, ...) {
-    init_paths();
-    char message[1024]{};
-    va_list args;
-    va_start(args, format);
-    vsnprintf(message, sizeof(message), format, args);
-    va_end(args);
-    if (journal == INVALID_HANDLE_VALUE) {
-        wchar_t folder[MAX_PATH]{};
-        swprintf_s(folder, L"%s\\..\\Logs", module_folder);
-        CreateDirectoryW(folder, nullptr);
-        wchar_t path[MAX_PATH]{};
-        for (int index = 1; index < 10000; ++index) {
-            swprintf_s(path, L"%s\\MouseAim-%05d.log", folder, index);
-            journal = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (journal != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_EXISTS) break;
-        }
-    }
-    if (journal != INVALID_HANDLE_VALUE) {
-        char line[1200]{};
-        int length = snprintf(line, sizeof(line), "%llu %s\r\n", GetTickCount64(), message);
-        DWORD written{};
-        WriteFile(journal, line, static_cast<DWORD>(length), &written, nullptr);
-        // Let Windows buffer normal diagnostics; never force a disk flush on
-        // the input/camera thread for every telemetry line.
-    }
-    FILE* status{};
-    if (_wfopen_s(&status, status_path, L"w") == 0 && status) {
-        fprintf(status, "%s\n", message);
-        fclose(status);
-    }
-}
+#include "async_diagnostics.h"
 
 float read_config_float(const wchar_t* key, float fallback) {
     wchar_t value[64]{};
@@ -297,11 +265,6 @@ bool prepare_mouse() {
 
 void mouse_loop() {
     bool f8_down = false, f9_down = false;
-    ULONGLONG snapshot_tick=0;
-    ULONGLONG published_tick=0;
-    bool published_on=false;
-    float published_pitch=0, published_yaw=0;
-    uintptr_t published_pawn=0;
     while (running.load()) {
         if (!raw_input_hooked.load()) {
             if (!mouse_device && !prepare_mouse()) {
@@ -332,33 +295,6 @@ void mouse_loop() {
         if (f9 && !f9_down) recenter_requested.store(true);
         f8_down = f8;
         f9_down = f9;
-        const auto now=GetTickCount64();
-        if (now-snapshot_tick>=33) {
-            snapshot_tick=now;
-            const bool on=active.load() && enabled.load() && now-pose_tick.load()<250 &&
-                foreground_is_game();
-            const float p=look_pitch.load(), y=look_yaw.load();
-            const uintptr_t pawn=aircraft.load();
-            // No repeated replacement of an identical target file during steady
-            // flight. A 0.5s heartbeat stays well inside Lua's 2s stale timeout.
-            const bool changed=on!=published_on || p!=published_pitch ||
-                y!=published_yaw || pawn!=published_pawn;
-            if (changed || now-published_tick>=500) {
-                wchar_t temp[MAX_PATH]{}, path[MAX_PATH]{};
-                swprintf_s(temp,L"%s\\camera-target.tmp",module_folder);
-                swprintf_s(path,L"%s\\camera-target.txt",module_folder);
-                FILE* out{};
-                if (_wfopen_s(&out,temp,L"w")==0 && out) {
-                    fprintf(out,"%llu %d %.8f %.8f %llX\n",now,on?1:0,p,y,
-                        static_cast<unsigned long long>(pawn));
-                    fclose(out);
-                    if (MoveFileExW(temp,path,MOVEFILE_REPLACE_EXISTING)) {
-                        published_tick=now; published_on=on; published_pitch=p;
-                        published_yaw=y; published_pawn=pawn;
-                    }
-                }
-            }
-        }
         Sleep(4);
     }
 }
@@ -441,49 +377,36 @@ void update_commands() {
 }
 #include "native_camera.h"
 
-void parse_pose(const char* line) {
-    if(strncmp(line,"GAZE ",5)==0) {
-        int value=-1;
-        if(sscanf_s(line,"GAZE %d",&value)==1 && (value==0 || value==1)) {
-            if(gaze_active.exchange(value!=0)!=(value!=0)) {
-                mouse_dx.store(0); mouse_dy.store(0);
-                command_pitch.store(0); command_yaw.store(0); command_roll.store(0);
-                log_line("gaze: %s",value?"native camera and controls; mouse target frozen":"mouse mode resumed");
-            }
-        }
-        return;
+void release_controls() {
+    active.store(false); aircraft.store(0);
+    command_pitch.store(0); command_yaw.store(0); command_roll.store(0);
+    mouse_dx.store(0); mouse_dy.store(0);
+    previous_pose_tick=0; free_look.reset();
+    receive_camera(0,0,0,0,0);
+}
+
+// Called synchronously on the game thread. Fixed numeric arguments replace
+// the pipe queue, sscanf and the camera-target disk snapshot entirely.
+void receive_pose(const double (&v)[13]) {
+    const uintptr_t address=static_cast<uintptr_t>(v[0]);
+    const float pitch=float(v[1]),yaw=float(v[2]),roll=float(v[3]);
+    const float view_pitch=float(v[4]),view_yaw=float(v[5]),view_roll=float(v[6]);
+    const float fov=float(v[7]),ox=float(v[8]),oy=float(v[9]),oz=float(v[10]);
+    const bool paused=v[11]!=0,gazing=v[12]!=0;
+    if(gaze_active.exchange(gazing)!=gazing) {
+        mouse_dx.store(0); mouse_dy.store(0);
+        command_pitch.store(0); command_yaw.store(0); command_roll.store(0);
+        log_line("gaze: %s",gazing?"native camera and controls; mouse target frozen":"mouse mode resumed");
     }
-    if(strncmp(line,"PAUSE ",6)==0) {
-        int value=-1;
-        if(sscanf_s(line,"PAUSE %d",&value)==1 && (value==0 || value==1)) {
-            const bool was_paused=game_paused.exchange(value!=0);
-            if(was_paused!=(value!=0)) {
-                mouse_dx.store(0); mouse_dy.store(0);
-                if(was_paused) resume_center_requested.store(true);
-                else { command_pitch.store(0); command_roll.store(0); command_yaw.store(0); }
-                log_line("game pause: %s",value?"paused; aim frozen":"resumed; centre aim on next pose");
-            }
-        }
-        return;
+    const bool was_paused=game_paused.exchange(paused);
+    if(was_paused!=paused) {
+        mouse_dx.store(0); mouse_dy.store(0);
+        if(was_paused) resume_center_requested.store(true);
+        else { command_pitch.store(0); command_roll.store(0); command_yaw.store(0); }
+        log_line("game pause: %s",paused?"paused; aim frozen":"resumed; centre aim on next pose");
     }
-    if(strncmp(line,"CAMERA ",7)==0) { receive_camera(line); return; }
-    unsigned long long address{};
-    float pitch{}, yaw{}, roll{}, view_pitch{}, view_yaw{}, view_roll{}, fov=100;
-    float ox{},oy{},oz{};
-    const int fields = sscanf_s(line, "POSE %llx %f %f %f %f %f %f %f %f %f %f", &address,
-                                &pitch, &yaw, &roll, &view_pitch, &view_yaw, &view_roll,&fov,&ox,&oy,&oz);
-    if (fields != 4 && fields != 7 && fields != 8 && fields != 11) return;
-    if(!std::isfinite(ox)||!std::isfinite(oy)||!std::isfinite(oz)) return;
     view_offset_x.store(ox); view_offset_y.store(oy); view_offset_z.store(oz);
-    if(std::isfinite(fov)) view_fov.store(std::clamp(fov,30.0f,150.0f));
-    if (fields == 4) {
-        view_pitch = pitch;
-        view_yaw = yaw;
-        view_roll = roll;
-    }
-    if (address < 0x10000 || address > 0x00007fffffff0000ull || (address & 7) ||
-        !std::isfinite(pitch) || !std::isfinite(yaw) || !std::isfinite(roll) ||
-        !std::isfinite(view_pitch) || !std::isfinite(view_yaw) || !std::isfinite(view_roll)) return;
+    view_fov.store(std::clamp(fov,30.0f,150.0f));
     if (aircraft.load() != static_cast<uintptr_t>(address)) {
         aircraft.store(static_cast<uintptr_t>(address));
         roll_reference.store(roll);
@@ -492,7 +415,7 @@ void parse_pose(const char* line) {
         recenter_requested.store(true);
         free_look.reset();
         log_line("aircraft acquired 0x%llX pose=(%.3f,%.3f,%.3f) camera=(%.3f,%.3f,%.3f)",
-                 address, pitch, yaw, roll, view_pitch, view_yaw, view_roll);
+                 static_cast<unsigned long long>(address), pitch, yaw, roll, view_pitch, view_yaw, view_roll);
     }
     pose_pitch.store(pitch);
     pose_yaw.store(yaw);
@@ -505,35 +428,6 @@ void parse_pose(const char* line) {
     update_commands();
 }
 
-void pipe_loop() {
-    while (running.load()) {
-        HANDLE pipe = CreateNamedPipeW(pipe_name, PIPE_ACCESS_INBOUND,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr);
-        if (pipe == INVALID_HANDLE_VALUE) {
-            Sleep(500);
-            continue;
-        }
-        BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : GetLastError() == ERROR_PIPE_CONNECTED;
-        if (connected) {
-            char buffer[4096]{};
-            std::string pending;
-            DWORD read{};
-            while (running.load() && ReadFile(pipe, buffer, sizeof(buffer), &read, nullptr) && read) {
-                pending.append(buffer, read);
-                size_t newline{};
-                while ((newline = pending.find('\n')) != std::string::npos) {
-                    parse_pose(pending.substr(0, newline).c_str());
-                    pending.erase(0, newline + 1);
-                }
-            }
-        }
-        DisconnectNamedPipe(pipe);
-        CloseHandle(pipe);
-        active.store(false);
-        aircraft.store(0);
-    }
-}
-
 void draw_overlay(HWND window, HDC dc, const RECT& rect, uint32_t* pixels) {
         RECT alpha_rects[4]={{20,35,1100,85}};
         unsigned alpha_count=1;
@@ -541,7 +435,7 @@ void draw_overlay(HWND window, HDC dc, const RECT& rect, uint32_t* pixels) {
         SetBkMode(dc,TRANSPARENT);
         SetTextColor(dc,RGB(245,245,245));
         char label[160]{};
-        snprintf(label,sizeof(label),"MouseFlight 0.2.29 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
+        snprintf(label,sizeof(label),"MouseFlight 0.2.30 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
             active.load() && enabled.load()?"ON":"STANDBY",
             target_pitch.load(),target_yaw.load(),camera_pitch.load(),camera_yaw.load());
         TextOutA(dc,28,40,label,static_cast<int>(strlen(label)));
@@ -790,16 +684,22 @@ bool create_absolute_hook(void* target, void* detour, void** trampoline_out) {
 }
 
 uintptr_t __fastcall process_input(unsigned char* state, unsigned char* context) {
-    ++calls;
+    // Enemy/non-player invocations do not query the keyboard or foreground.
+    const uintptr_t pawn = aircraft.load();
+    if (!pawn || reinterpret_cast<uintptr_t>(state)!=pawn+0x22a0) {
+        if(perf_enabled.load()) ++perf_other_inputs;
+        return original(state,context);
+    }
+    if(perf_enabled.load()) ++perf_player_inputs;
+    if(!active.load() || GetTickCount64()-pose_tick.load()>1000 || !enabled.load() ||
+       game_paused.load() || gaze_active.load() || !foreground_is_game()) return original(state,context);
     // Manual pitch also suspends automatic roll, matching MouseFlight maneuvers.
     // Preserve AC's native keyboard values, including opposing-key handling.
     auto held=[](int key) { return (GetAsyncKeyState(key)&0x8000)!=0; };
     const bool keyboard_pitch=held('W') || held('S');
     const bool keyboard_roll=keyboard_pitch || held('A') || held('D');
     const bool keyboard_yaw=held('Q') || held('E');
-    const uintptr_t pawn = aircraft.load();
-    const bool valid_pose = active.load() && pawn && GetTickCount64() - pose_tick.load() <= 1000;
-    bool override_input = valid_pose && enabled.load() && !game_paused.load() && !gaze_active.load() && foreground_is_game();
+    bool override_input = true; // Lifecycle/foreground already checked above.
     if (override_input && reinterpret_cast<uintptr_t>(state) == pawn + 0x22a0) {
         __try {
             if (*reinterpret_cast<uintptr_t*>(context) != pawn + 0x2268 ||
@@ -828,7 +728,6 @@ uintptr_t __fastcall process_input(unsigned char* state, unsigned char* context)
             // Preserve only the proportional input target; downstream response remains stock.
             if(!keyboard_yaw)
                 *reinterpret_cast<double*>(state + 8) = static_cast<double>(command_yaw.load());
-            ++writes;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             active.store(false);
         }
@@ -872,11 +771,24 @@ bool offline_authorized() {
     wchar_t value[16]{};
     return GetEnvironmentVariableW(L"EOS_USE_ANTICHEATCLIENTNULL", value, 16) > 0 && wcscmp(value, L"1") == 0;
 }
+bool bridge_verified=false;
+DWORD bridge_thread=0;
+std::atomic<bool> reload_requested{false};
+bool on_bridge_thread() { return bridge_thread && bridge_thread==GetCurrentThreadId(); }
 } // namespace
 
-extern "C" __declspec(dllexport) int ac8_mouseaim_start(void*) {
-    if (running.load()) return 0;
+extern "C" __declspec(dllexport) int ac8_mouseaim_start(lua_State* state) {
     init_paths();
+    if(!logger_started.exchange(true)) {
+        QueryPerformanceFrequency(&perf_frequency);
+        std::thread(logger_loop).detach();
+    }
+    if(!bridge_verified) bridge_verified=compatible_lua_runtime();
+    if(!bridge_verified) { log_line("bridge refused: UE4SS runtime hash mismatch"); return 0; }
+    LuaView lua(state);
+    double handshake[2]{};
+    if(!read_numbers(lua,handshake) || handshake[0]!=1729 || handshake[1]!=0.125) return 0;
+    if(running.load()) { lua.set_number(30); return 1; }
     if (!offline_authorized()) {
         log_line("inactive: offline launch marker missing; multiplayer-safe refusal");
         return 0;
@@ -891,16 +803,76 @@ extern "C" __declspec(dllexport) int ac8_mouseaim_start(void*) {
     }
     running.store(true);
     std::thread(mouse_loop).detach();
-    std::thread(pipe_loop).detach();
     std::thread(overlay_loop).detach();
     log_line("ready: F8 toggle, F9 recenter; RMB reserved for game actions");
-    return 0;
+    log_line("0.2.30 direct numeric bridge; realtime file/pipe transport removed; F5 performance counters");
+    lua.set_number(30);
+    return 1;
 }
 
 extern "C" __declspec(dllexport) int ac8_mouseaim_reload(void*) {
-    load_config();
-    recenter_requested.store(true);
-    log_line("configuration reloaded");
+    reload_requested.store(true);
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int ac8_mouseaim_begin(void*) {
+    if(!running.load()) return 0;
+    if(!bridge_thread) bridge_thread=GetCurrentThreadId();
+    if(!on_bridge_thread()) return 0;
+    if(reload_requested.exchange(false)) {
+        load_config(); recenter_requested.store(true); log_line("configuration reloaded");
+    }
+    if(perf_enabled.load()) {
+        script_start=perf_clock();
+        if(previous_frame_start) {
+            const auto gap=perf_us(script_start-previous_frame_start);
+            perf_frame_gap.add(gap);
+            if(gap>50000) ++perf_hitches;
+        }
+        previous_frame_start=script_start;
+    } else { script_start=0; previous_frame_start=0; }
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int ac8_mouseaim_frame(lua_State* state) {
+    if(!running.load() || !on_bridge_thread()) return 0;
+    PerfSpan timing(perf_bridge);
+    LuaView lua(state); double v[13]{};
+    if(!read_numbers(lua,v) || !live_pointer_number(v[0])) { release_controls(); return 0; }
+    for(size_t i=1;i<11;++i) if(std::abs(v[i])>1e12) { release_controls(); return 0; }
+    if((v[11]!=0 && v[11]!=1) || (v[12]!=0 && v[12]!=1)) { release_controls(); return 0; }
+    receive_pose(v);
+    const bool on=enabled.load() && !game_paused.load() && !gaze_active.load() && foreground_is_game();
+    lua.set_number(on?1:0); lua.set_number(look_pitch.load()); lua.set_number(look_yaw.load());
+    return 3;
+}
+
+extern "C" __declspec(dllexport) int ac8_mouseaim_camera(lua_State* state) {
+    if(!running.load() || !on_bridge_thread()) return 0;
+    LuaView lua(state); double v[5]{};
+    if(!read_numbers(lua,v) ||
+       std::abs(v[2])>1e9 || std::abs(v[3])>1e9 || std::abs(v[4])>1e9 ||
+       (v[0]!=0 && (!live_pointer_number(v[0]) || !live_pointer_number(v[1]) ||
+                    static_cast<uintptr_t>(v[1])!=aircraft.load()))) {
+        release_controls(); return 0;
+    }
+    const bool accepted=receive_camera(static_cast<uintptr_t>(v[0]),v[0]?static_cast<uintptr_t>(v[1]):0,v[2],v[3],v[4]);
+    if(script_start) { perf_script.add(perf_us(perf_clock()-script_start)); script_start=0; }
+    lua.set_number(accepted?1:0);
+    return 1;
+}
+
+extern "C" __declspec(dllexport) int ac8_mouseaim_release(void*) {
+    if(running.load() && on_bridge_thread()) { release_controls(); script_start=0; }
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int ac8_mouseaim_perf(void*) {
+    if(running.load()) {
+        const bool enabled_now=!perf_enabled.load(); perf_enabled.store(enabled_now);
+        if(!enabled_now) perf_flush.store(true);
+        log_line("PERF capture %s (10-second summaries, no per-frame disk writes)",enabled_now?"ON":"OFF");
+    }
     return 0;
 }
 
