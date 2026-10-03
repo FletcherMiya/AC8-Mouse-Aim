@@ -1,17 +1,21 @@
--- AC8 Mouse Aim 0.1.0: offline-only attitude feed for the native input controller.
+-- 0.2.30: game-thread numeric bridge; no realtime files or named pipes.
 local directory = assert(debug.getinfo(1, "S").source:sub(2):match("^(.*[/\\])"))
 local aim_camera = dofile(directory .. "camera.lua")
 local gaze_probe = dofile(directory .. "gaze_probe.lua")
 local gaze = dofile(directory .. "gaze.lua")
 local start_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_start"))
 local reload_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_reload"))
-local pipe = nil
+local begin_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_begin"))
+local frame_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_frame"))
+local camera_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_camera"))
+local release_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_release"))
+local perf_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_perf"))
 local current_address = nil
 local startup_address, startup_time = nil, 0
 local next_search = 0
 local reported_rotation_shape = false
-local camera_metric_time=0
 local pause_gameplay
+local rotation_fields={}
 
 local function unwrap_number(value)
     if type(value) == "number" then return value end
@@ -26,10 +30,16 @@ local function unwrap_number(value)
 end
 
 local function rotation_component(rotation, wanted)
+    -- Cache discovered spellings (AC exposes pitch/Yaw/Roll) instead of
+    -- enumerating the same tables for each component every frame.
+    if type(rotation)=='table' and rotation_fields[wanted] then
+        local value=unwrap_number(rotation[rotation_fields[wanted]])
+        if value then return value end
+    end
     local ok_direct, direct = pcall(function() return rotation[wanted] end)
     if ok_direct then
         local value = unwrap_number(direct)
-        if value then return value end
+        if value then rotation_fields[wanted]=wanted; return value end
     end
 
     if type(rotation) == "table" then
@@ -37,7 +47,7 @@ local function rotation_component(rotation, wanted)
         for key, candidate in pairs(rotation) do
             if type(key) == "string" and string.find(string.lower(key), wanted_lower, 1, true) then
                 local value = unwrap_number(candidate)
-                if value then return value end
+                if value then rotation_fields[wanted]=key; return value end
             end
         end
     end
@@ -60,20 +70,6 @@ local function notice(message)
         print("[AC8MouseAim] " .. message .. "\n")
         last_notice = message
     end
-end
-
-local function close_pipe()
-    if pipe then pcall(function() pipe:close() end) end
-    pipe = nil
-end
-
-local function connect_pipe()
-    if pipe then return true end
-    local handle = io.open("\\\\.\\pipe\\AC8MouseAim", "w")
-    if not handle then return false end
-    handle:setvbuf("no")
-    pipe = handle
-    return true
 end
 
 local plane_class,cached_controller
@@ -104,9 +100,7 @@ local function player_plane()
     return nil, nil
 end
 
-local function camera_rotation(controller, fallback)
-    local ok_manager, manager = pcall(function() return controller.PlayerCameraManager end)
-    if not ok_manager or not manager or not manager:IsValid() then return fallback end
+local function camera_rotation(manager, fallback)
     local ok_camera, rotation = pcall(function() return manager:GetCameraRotation() end)
     if ok_camera and rotation then return rotation end
     local ok_actor, actor_rotation = pcall(function() return manager:K2_GetActorRotation() end)
@@ -116,16 +110,18 @@ end
 
 RegisterKeyBind(Key.F10, function()
     local ok, err = pcall(reload_native)
-    notice(ok and "Configuration reloaded; target recentered." or ("Reload failed: " .. tostring(err)))
+    notice(ok and "Configuration reload queued for next game frame." or ("Reload failed: " .. tostring(err)))
 end)
 RegisterKeyBind(Key.F6, function() gaze_probe.request() end)
+RegisterKeyBind(Key.F5, function() perf_native() end)
 
-start_native()
+assert(start_native(1729,0.125)==30,'AC8 direct bridge unavailable; control disabled (check native log).')
 
 if EngineTickAvailable == false or type(LoopInGameThreadAfterFrames) ~= "function" then
     notice("Disabled: required game-thread callback unavailable.")
 else
     LoopInGameThreadAfterFrames(1, function()
+        begin_native()
         local ok, err = pcall(function()
             local now = os.time()
             if now < next_search then return end
@@ -135,7 +131,7 @@ else
                 startup_address=nil; startup_time=0
                 aim_camera.restore()
                 if current_address then
-                    close_pipe()
+                    release_native()
                     current_address = nil
                 end
                 next_search = now + 1
@@ -145,20 +141,18 @@ else
             local incoming_address=pawn:GetAddress()
             if startup_address~=incoming_address then
                 aim_camera.restore()
-                close_pipe()
+                release_native()
                 current_address=nil
                 startup_address=incoming_address
                 startup_time=0
             end
+            if not pause_gameplay or not pause_gameplay:IsValid() then
+                pause_gameplay=StaticFindObject('/Script/Engine.Default__GameplayStatics')
+            end
+            local dt=pause_gameplay:GetWorldDeltaSeconds(pawn)
             -- Allow the spawned pawn's mission transform to replace construction defaults.
             if startup_time<0.5 then
-                local gameplay=StaticFindObject("/Script/Engine.Default__GameplayStatics")
-                startup_time=startup_time+math.max(0,math.min(0.1,gameplay:GetWorldDeltaSeconds(pawn)))
-                return
-            end
-            if not connect_pipe() then
-                next_search = now + 1
-                notice("Waiting for native controller pipe.")
+                startup_time=startup_time+math.max(0,math.min(0.1,dt))
                 return
             end
             gaze_probe.update(pawn,controller,directory)
@@ -174,53 +168,38 @@ else
                 end
                 error("Unable to read aircraft Pitch/Yaw/Roll")
             end
-            local gazing=gaze.update(pawn)
-            local desired_camera
-            if gazing then
-                aim_camera.seed(controller.PlayerCameraManager:GetCameraRotation(),rotation_component)
-            else
-                desired_camera=aim_camera.update(pawn,controller,rotation,rotation_component,directory)
-            end
-            local camera = camera_rotation(controller, rotation)
+            local manager=controller.PlayerCameraManager
+            assert(manager and manager:IsValid(),'Camera manager unavailable')
+            local gazing=gaze.update(pawn,pause_gameplay:GetRealTimeSeconds(pawn))
+            local camera = camera_rotation(manager, rotation)
             local camera_pitch = rotation_component(camera, "Pitch") or pitch
             local camera_yaw = rotation_component(camera, "Yaw") or yaw
             local camera_roll = rotation_component(camera, "Roll") or roll
-            local address = pawn:GetAddress()
+            local address = incoming_address
             assert(type(address) == "number" and address > 0, "Invalid aircraft address")
             local fov=100
-            pcall(function() fov=controller.PlayerCameraManager:GetFOVAngle() end)
+            pcall(function() fov=manager:GetFOVAngle() end)
             local position=pawn:K2_GetActorLocation()
-            local view_position=controller.PlayerCameraManager:GetCameraLocation()
+            local view_position=manager:GetCameraLocation()
             local ox=assert(rotation_component(view_position,"X"))-assert(rotation_component(position,"X"))
             local oy=assert(rotation_component(view_position,"Y"))-assert(rotation_component(position,"Y"))
             local oz=assert(rotation_component(view_position,"Z"))-assert(rotation_component(position,"Z"))
-            if now-camera_metric_time>=10 then
-                camera_metric_time=now
-                pcall(function()
-                    local v=pawn:GetVelocity()
-                    local vx,vy,vz=rotation_component(v,'X'),rotation_component(v,'Y'),rotation_component(v,'Z')
-                    print(string.format('[AC8MouseAim] Camera metrics: requested=%s speed=%.1fm/s fov=%.2f sampledDistance=%.2fm\n',
-                        desired_camera and 'custom' or 'native',math.sqrt(vx*vx+vy*vy+vz*vz)/100,
-                        fov,math.sqrt(ox*ox+oy*oy+oz*oz)/100))
-                end)
-            end
-            if not pause_gameplay or not pause_gameplay:IsValid() then
-                pause_gameplay=StaticFindObject('/Script/Engine.Default__GameplayStatics')
-            end
             local paused=pause_gameplay:IsGamePaused(pawn)
-            local line = (gazing and 'GAZE 1\n' or 'GAZE 0\n')..(paused and 'PAUSE 1\n' or 'PAUSE 0\n')..string.format("POSE %X %.7g %.7g %.7g %.7g %.7g %.7g %.7g %.7g %.7g %.7g\n",
-                address, pitch, yaw, roll, camera_pitch, camera_yaw, camera_roll,fov,ox,oy,oz)
-            if desired_camera then
-                line=line..string.format("CAMERA %X %X %.9g %.9g %.9g\n",
-                    controller.PlayerCameraManager:GetAddress(),address,
-                    desired_camera.pitch,desired_camera.yaw,desired_camera.roll)
+            local on,target_pitch,target_yaw=frame_native(address,pitch,yaw,roll,
+                camera_pitch,camera_yaw,camera_roll,fov,ox,oy,oz,paused and 1 or 0,gazing and 1 or 0)
+            assert(on~=nil,'Native frame rejected')
+            local desired_camera
+            if gazing then
+                aim_camera.seed(camera,rotation_component)
             else
-                line=line.."CAMERA 0 0 0 0 0\n"
+                desired_camera=aim_camera.update(pawn,controller,rotation,rotation_component,
+                    on,target_pitch,target_yaw,dt)
             end
-            local wrote, write_error = pipe:write(line)
-            if not wrote then
-                close_pipe()
-                error(write_error or "pipe write failed")
+            if desired_camera then
+                assert(camera_native(manager:GetAddress(),address,
+                    desired_camera.pitch,desired_camera.yaw,desired_camera.roll)==1,'Camera command rejected')
+            else
+                camera_native(0,0,0,0,0)
             end
             if current_address ~= address then
                 current_address = address
@@ -228,7 +207,7 @@ else
             end
         end)
         if not ok then
-            close_pipe()
+            release_native()
             current_address = nil
             next_search = os.time() + 1
             notice("Recovering after runtime error: " .. tostring(err))

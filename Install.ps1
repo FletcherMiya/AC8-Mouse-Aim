@@ -85,6 +85,7 @@ foreach ($name in @('Launch-AC8-Mouse-Aim.cmd','Disable-Mod-For-Multiplayer.cmd'
 }
 # Verify the actual files, not just whether Copy-Item returned successfully.
 foreach ($relative in @(
+    'Game\Binaries\Win64\UE4SS\UE4SS.dll',
     'Game\Binaries\Win64\UE4SS\Mods\AC8MouseAim\Scripts\ac8_mouse_aim_010.dll',
     'Game\Binaries\Win64\UE4SS\Mods\AC8MouseAim\Scripts\main.lua',
     'Game\Binaries\Win64\UE4SS\Mods\AC8MouseAim\Scripts\camera.lua',
@@ -97,8 +98,8 @@ foreach ($relative in @(
     $actual = (Get-FileHash -LiteralPath (Join-Path $GamePath $relative) -Algorithm SHA256).Hash
     if ($actual -ne $expected) { throw "Installation verification failed: $relative" }
 }
-Write-Host 'VERIFIED: game files match this 0.2.29 release.' -ForegroundColor Green
-Write-Host 'Hold F for free look; release F to return to the flight target.'
+Write-Host 'VERIFIED: game files match this 0.2.30 performance release.' -ForegroundColor Green
+Write-Host 'Direct in-process transport; HUD unchanged. Optional F5 performance capture.'
 if ($isUpgrade) { Write-Host 'The startup loader was repaired and the old files were backed up.' }
 Write-Host 'Start ACE COMBAT 8 through Steam with the existing offline launch option.'
 Write-Host 'Before multiplayer, run Disable-Mod-For-Multiplayer.cmd and then launch from Steam.'

@@ -7,7 +7,7 @@ local release_at=0
 local failed=false
 local manual_gaze=false
 local hold_threshold=0.35 -- Mod debounce; not claimed to be AC's internal threshold.
-function M.update(pawn)
+function M.update(pawn,frame_time)
     if owner~=pawn:GetAddress() then
         owner=pawn:GetAddress(); focus=nil; impact=nil; last_active=false; release_at=0; failed=false; manual_gaze=false
     end
@@ -16,7 +16,7 @@ function M.update(pawn)
         if not focus or not focus:IsValid() then focus=pawn.CameraViewComponent.CachedFocusTarget end
         if not impact or not impact:IsValid() then impact=pawn.ImpactCamera end
         local cinematic=impact and impact:IsValid() and impact.bIsActive==true
-        if not gameplay or not gameplay:IsValid() then gameplay=StaticFindObject('/Script/Engine.Default__GameplayStatics') end
+        if not frame_time and (not gameplay or not gameplay:IsValid()) then gameplay=StaticFindObject('/Script/Engine.Default__GameplayStatics') end
         local valid_focus=focus and focus:IsValid()
         local event=valid_focus and focus.ProcessingEventFocusTarget:Get()
         -- CandidateEventFocusTarget and FocusTarget alone are NOT activation signals.
@@ -26,7 +26,7 @@ function M.update(pawn)
         elseif held>=hold_threshold then manual_gaze=true end
         local forced=valid_focus and focus.bForceInput==true
         local event_active=event and event:IsValid()
-        local now=gameplay:GetRealTimeSeconds(pawn)
+        local now=frame_time or gameplay:GetRealTimeSeconds(pawn)
         if manual_gaze or forced or event_active or cinematic then release_at=now+0.25 end
         local active=manual_gaze or forced or event_active or cinematic or now<release_at
         if active~=last_active then
