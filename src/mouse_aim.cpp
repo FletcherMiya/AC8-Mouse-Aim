@@ -19,6 +19,7 @@
 #include "vendor/minhook/include/MinHook.h"
 #include "yaw_signature.h"
 #include "flight_math.h"
+#include "free_look.h"
 
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -77,6 +78,9 @@ std::atomic<unsigned long long> pose_tick{0};
 std::atomic<long> mouse_dx{0}, mouse_dy{0};
 std::atomic<float> command_pitch{0}, command_roll{0}, command_yaw{0};
 std::atomic<float> target_pitch{0}, target_yaw{0};
+// Camera destination is independent of the flight target while F is held.
+std::atomic<float> look_pitch{0}, look_yaw{0};
+flight::FreeLook free_look;
 std::atomic<bool> recenter_requested{true};
 std::atomic<unsigned long long> calls{0}, writes{0};
 float previous_pitch{}, previous_yaw{}, previous_roll{};
@@ -333,7 +337,7 @@ void mouse_loop() {
             snapshot_tick=now;
             const bool on=active.load() && enabled.load() && now-pose_tick.load()<250 &&
                 foreground_is_game();
-            const float p=target_pitch.load(), y=target_yaw.load();
+            const float p=look_pitch.load(), y=look_yaw.load();
             const uintptr_t pawn=aircraft.load();
             // No repeated replacement of an identical target file during steady
             // flight. A 0.5s heartbeat stays well inside Lua's 2s stale timeout.
@@ -362,6 +366,7 @@ void mouse_loop() {
 void update_commands() {
     using namespace flight;
     if (!active.load() || !enabled.load() || game_paused.load() || gaze_active.load()) {
+        free_look.reset();
         command_pitch.store(0); command_roll.store(0); command_yaw.store(0);
         if(game_paused.load() || gaze_active.load()) { mouse_dx.store(0); mouse_dy.store(0); }
         previous_pose_tick = 0;
@@ -396,8 +401,10 @@ void update_commands() {
         mouse_dx.store(0); mouse_dy.store(0);
         filtered_pitch_rate=filtered_yaw_rate=filtered_roll_rate=0;
     }
-    aim=rotate(aim,view.r,mouse_dy.exchange(0)*config.sensitivity*rad);
-    aim=rotate(aim,view.u,mouse_dx.exchange(0)*config.sensitivity*rad);
+    const bool looking=!manual && (GetAsyncKeyState('F')&0x8000)!=0;
+    const V camera_target=free_look.step(looking,aim,view,
+        mouse_dx.exchange(0)*config.sensitivity,mouse_dy.exchange(0)*config.sensitivity);
+    look_pitch.store(flight::pitch(camera_target)); look_yaw.store(flight::yaw(camera_target));
     target_pitch.store(flight::pitch(aim)); target_yaw.store(flight::yaw(aim));
     const float f=dot(aim,b.f), right=dot(aim,b.r), up=dot(aim,b.u);
     const float angle=std::acos(std::clamp(f,-1.0f,1.0f))/rad;
@@ -483,6 +490,7 @@ void parse_pose(const char* line) {
         previous_pose_tick = 0;
         telemetry_tick = 0;
         recenter_requested.store(true);
+        free_look.reset();
         log_line("aircraft acquired 0x%llX pose=(%.3f,%.3f,%.3f) camera=(%.3f,%.3f,%.3f)",
                  address, pitch, yaw, roll, view_pitch, view_yaw, view_roll);
     }
@@ -533,7 +541,7 @@ void draw_overlay(HWND window, HDC dc, const RECT& rect, uint32_t* pixels) {
         SetBkMode(dc,TRANSPARENT);
         SetTextColor(dc,RGB(245,245,245));
         char label[160]{};
-        snprintf(label,sizeof(label),"MouseFlight 0.2.28 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
+        snprintf(label,sizeof(label),"MouseFlight 0.2.29 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
             active.load() && enabled.load()?"ON":"STANDBY",
             target_pitch.load(),target_yaw.load(),camera_pitch.load(),camera_yaw.load());
         TextOutA(dc,28,40,label,static_cast<int>(strlen(label)));

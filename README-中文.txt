@@ -15,7 +15,8 @@ cmd /d /c "set EOS_USE_ANTICHEATCLIENTNULL=1&& %command% -anticheat_settings=AC8
 
 
 特殊操作：
-F8-切换原生操作/摄像机与鼠标飞控
+F - 自由观察相机
+F8 - 切换原生操作/摄像机与鼠标飞控
 
 常见问题：
 提示An unrelated UE4SS/dwmapi installation was found.

@@ -97,8 +97,8 @@ foreach ($relative in @(
     $actual = (Get-FileHash -LiteralPath (Join-Path $GamePath $relative) -Algorithm SHA256).Hash
     if ($actual -ne $expected) { throw "Installation verification failed: $relative" }
 }
-Write-Host 'VERIFIED: game files match this 0.2.28 release.' -ForegroundColor Green
-Write-Host 'Installed cinematic camera handoff and reduced background I/O. F6 remains optional.'
+Write-Host 'VERIFIED: game files match this 0.2.29 release.' -ForegroundColor Green
+Write-Host 'Hold F for free look; release F to return to the flight target.'
 if ($isUpgrade) { Write-Host 'The startup loader was repaired and the old files were backed up.' }
 Write-Host 'Start ACE COMBAT 8 through Steam with the existing offline launch option.'
 Write-Host 'Before multiplayer, run Disable-Mod-For-Multiplayer.cmd and then launch from Steam.'
