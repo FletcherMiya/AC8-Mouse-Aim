@@ -199,7 +199,6 @@ build.cmd
 
 ## 致谢与许可
 
-- [MouseFlight](https://github.com/brihernandez/MouseFlight)：鼠标指向飞控与相机设计参考，MIT 许可。
 - [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS)：模组加载、Lua 运行环境和接口，MIT 许可。
 - [MinHook](https://github.com/TsudaKageyu/minhook)：原生函数钩子，BSD 2-Clause 许可。
 
