@@ -181,7 +181,7 @@ Game/Binaries/Win64/UE4SS/UE4SS.log
 
 ### 卸载
 
-退出游戏，在游戏根目录运行 `Uninstall-AC8-Mouse-Aim.ps1`，并手动移除 Steam 中本项目的离线启动参数。
+退出游戏，在游戏根目录运行 `Uninstall-AC8-Mouse-Aim.cmd`，并手动移除 Steam 中本项目的离线启动参数。
 
 共存安装器附带的卸载脚本只移走本模组及其辅助文件、移除本模组启用项，保留共用加载器、UE4SS、设置和其他模组。移走的文件可从 `AC8MouseAim-Backups` 恢复。
 
