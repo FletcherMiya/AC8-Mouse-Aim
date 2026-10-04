@@ -1,4 +1,11 @@
-AC8 Mouse Aim 0.2.34 (narrower arrival transition)
+AC8 Mouse Aim 0.2.35 (lateral capture and roll tracking preview)
+
+Capture bank follows remaining lateral turn demand; roll tracks moving demand
+and predicts short-term response from measured angular acceleration. No online
+aircraft identification. Pitch/yaw braking core and camera/HUD are unchanged.
+F11 records bankDemand, bankTargetRate and predictedRollRate for comparison.
+
+Previous changes:
 
 Only narrows the smooth speed-envelope transition (power 4 to 8) and updates
 its derivative. Response estimates, stopping bounds and rollout coupling stay

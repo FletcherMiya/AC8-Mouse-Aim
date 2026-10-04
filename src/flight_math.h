@@ -120,6 +120,7 @@ struct GuidanceOutput {
     float pitch{},yaw{},roll{},bank_error{},turn_weight{},lead_scale{1};
     float pitch_error{},yaw_error{};
     float pitch_coupling{},yaw_coupling{};
+    float bank_demand{},bank_target_rate{},predicted_roll_rate{};
     ArrivalOutput pitch_arrival,yaw_arrival,roll_arrival;
 };
 // AC input-response estimates, not aerodynamic forces. No integral or hidden
@@ -127,10 +128,43 @@ struct GuidanceOutput {
 inline float rate_command(float wanted,float actual,float full_rate) {
     return std::clamp((2*wanted-actual)/full_rate,-1.0f,1.0f);
 }
+// Roll tracking uses measured acceleration to compensate residual response lag,
+// and separates moving bank demand from actual closing speed. No integral and
+// no aircraft-identification assumption. State belongs only to the active pawn.
+struct RollTracker {
+    bool valid=false;
+    float previous_error{},previous_rate{},target_rate{},acceleration{};
+    void reset() { *this={}; }
+    ArrivalOutput step(float error,float rate,float dt,float& predicted) {
+        if(dt<=0 || dt>0.1f) reset();
+        if(valid) {
+            const float delta=wrapped(error-previous_error);
+            const float alpha=1-std::exp(-dt/0.10f);
+            // error_dot = target_rate - aircraft_rate. Ignore discontinuous
+            // target jumps (recenter/large mouse jumps), not ordinary tracking.
+            const float moving=std::abs(delta)<20 ? std::clamp(delta/dt+(rate+previous_rate)*0.5f,-80.0f,80.0f) : 0;
+            target_rate+=(moving-target_rate)*alpha;
+            const float measured=std::clamp((rate-previous_rate)/dt,-500.0f,500.0f);
+            acceleration+=(measured-acceleration)*alpha;
+        } else { target_rate=0; acceleration=0; }
+        previous_error=error; previous_rate=rate; valid=dt>0;
+        predicted=rate+std::clamp(acceleration*0.08f,-25.0f,25.0f);
+        auto result=predictive_arrival(error,predicted-target_rate,140,220,3.5f,.35f,1.5f);
+        const float absolute_wanted=result.wanted+target_rate;
+        result.wanted=std::clamp(absolute_wanted,-140.0f,140.0f);
+        result.acceleration+=4.0f*(result.wanted-absolute_wanted);
+        // Inverse response damping is based on actual aircraft motion, not
+        // relative closing rate; avoid treating target movement as drag.
+        result.command=std::clamp((result.acceleration+1.5f*predicted)/220,-1.0f,1.0f);
+        result.brake=std::abs(rate)>0.01f ? std::clamp(-result.command*std::copysign(1.0f,rate),0.0f,1.0f) : 0;
+        return result;
+    }
+};
 struct CoordinatedGuidance {
     float turn_side=1;
-    void reset() { turn_side=1; }
-    GuidanceOutput step(Basis b,V aim,float pitch_rate,float yaw_rate,float roll_rate) {
+    RollTracker roll_tracker;
+    void reset() { turn_side=1; roll_tracker.reset(); }
+    GuidanceOutput step(Basis b,V aim,float pitch_rate,float yaw_rate,float roll_rate,float dt=0) {
         GuidanceOutput out;
         const float f=std::clamp(dot(aim,b.f),-1.0f,1.0f);
         const float right=dot(aim,b.r),up=dot(aim,b.u);
@@ -141,7 +175,6 @@ struct CoordinatedGuidance {
         const float closing=tangent>1e-5f ? (up*pitch_rate+right*yaw_rate)/tangent : 0;
         const float lead=std::clamp(closing*0.18f,0.0f,angle*0.65f);
         out.lead_scale=angle>1e-5f ? (angle-lead)/angle : 1;
-        const float predicted_angle=angle-lead;
         const float level=std::atan2(b.r.z,b.u.z)/rad;
         if(std::abs(right)>0.08f) turn_side=right>0?1.0f:-1.0f;
         float turn=std::atan2(right,up)/rad;
@@ -150,12 +183,30 @@ struct CoordinatedGuidance {
         if(tangent<1e-4f && f<0) turn=0;
         else if(up<0 && std::abs(right)<0.08f)
             turn=std::atan2(turn_side*std::abs(right),up)/rad;
-        out.turn_weight=smooth_range(predicted_angle,2.0f,18.0f);
+        // In the capture region, bank demand follows remaining lateral turn
+        // demand in a horizon frame. Do not blend directly to wings-level just
+        // because total angle is small and leave several degrees to the rudder.
+        V horizon_right=cross(V{0,0,1},b.f);
+        const bool near_pole=dot(horizon_right,horizon_right)<0.0025f;
+        horizon_right=near_pole?b.r:unit(horizon_right);
+        const V horizon_up=cross(b.f,horizon_right);
+        const float lateral=std::atan2(dot(aim,horizon_right),f)/rad*out.lead_scale;
+        const float vertical=std::atan2(dot(aim,horizon_up),f)/rad*out.lead_scale;
+        const float lateral_demand=dead(lateral,0.15f)*1.8f;
+        const float vertical_demand=std::max(0.0f,dead(vertical,0.15f)*2.0f);
+        out.bank_demand=std::atan2(lateral_demand,3.0f+vertical_demand)/rad;
+        const float capture_error=wrapped((near_pole?0:level)+out.bank_demand);
+        const float acquisition=smooth_range(angle,12.0f,35.0f);
+        out.turn_weight=std::max(acquisition,smooth_range(std::abs(lateral),0.15f,5.0f));
         // Modest below-nose requests can be pushed toward directly; do not
         // command an inverted aircraft for a small downward cursor movement.
         if(f>0 && up<0) out.turn_weight*=smooth_range(angle,25.0f,60.0f);
-        out.bank_error=wrapped(level+wrapped(turn-level)*out.turn_weight);
-        out.roll_arrival=predictive_arrival(out.bank_error,roll_rate,140,220,3.5f,0.35f,1.5f);
+        // Retain large-angle lift-vector acquisition and direct small pushovers.
+        float capture=capture_error;
+        if(f>0 && up<0) capture=wrapped(level+wrapped(capture_error-level)*smooth_range(angle,25.0f,60.0f));
+        out.bank_error=wrapped(capture+wrapped(turn-capture)*acquisition);
+        out.roll_arrival=roll_tracker.step(out.bank_error,roll_rate,dt,out.predicted_roll_rate);
+        out.bank_target_rate=roll_tracker.target_rate;
         out.roll=out.roll_arrival.command;
 
         // Pointing error is a tangent-plane rotation vector. Unlike atan2 with
