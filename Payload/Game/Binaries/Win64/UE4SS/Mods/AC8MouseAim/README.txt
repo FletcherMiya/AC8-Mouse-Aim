@@ -1,4 +1,8 @@
-AC8 Mouse Aim 0.2.33 (response-matched braking preview)
+AC8 Mouse Aim 0.2.34 (narrower arrival transition)
+
+Only narrows the smooth speed-envelope transition (power 4 to 8) and updates
+its derivative. Response estimates, stopping bounds and rollout coupling stay
+unchanged. To compare 0.2.33, close the game and reinstall its retained package.
 
 Stopping prediction and stick inversion share the same estimated axis response.
 Arrival-curve acceleration feed-forward and bounded rollout coupling added.

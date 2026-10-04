@@ -419,7 +419,7 @@ void update_commands() {
     }
     if(now-telemetry_tick>=10000) {
         telemetry_tick=now;
-        log_line("0.2.33 mode=%d localScaled=(%.3f,%.3f) angle=%.1f roll=%.1f rollErrorDeg=%.3f bodyrate=(%.1f,%.1f,%.1f) cmd=(%.2f,%.2f,%.2f) turnWeight=%.3f leadScale=%.3f",
+        log_line("0.2.34 mode=%d localScaled=(%.3f,%.3f) angle=%.1f roll=%.1f rollErrorDeg=%.3f bodyrate=(%.1f,%.1f,%.1f) cmd=(%.2f,%.2f,%.2f) turnWeight=%.3f leadScale=%.3f",
           config.controller_mode,p,y,angle,pose_roll.load(),roll_error,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
           command_pitch.load(),command_yaw.load(),command_roll.load(),config.controller_mode?guidance.turn_weight:roll_blend,guidance.lead_scale);
     }
@@ -484,7 +484,7 @@ void draw_overlay(HWND window, HDC dc, const RECT& rect, uint32_t* pixels) {
         SetBkMode(dc,TRANSPARENT);
         SetTextColor(dc,RGB(245,245,245));
         char label[160]{};
-        snprintf(label,sizeof(label),"MouseFlight 0.2.33 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
+        snprintf(label,sizeof(label),"MouseFlight 0.2.34 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
             active.load() && enabled.load()?"ON":"STANDBY",
             target_pitch.load(),target_yaw.load(),camera_pitch.load(),camera_yaw.load());
         TextOutA(dc,28,40,label,static_cast<int>(strlen(label)));
@@ -854,7 +854,7 @@ extern "C" __declspec(dllexport) int ac8_mouseaim_start(lua_State* state) {
     std::thread(mouse_loop).detach();
     std::thread(overlay_loop).detach();
     log_line("ready: F8 toggle, F9 recenter; RMB reserved for game actions");
-    log_line("0.2.33 response-matched braking and rollout coupling; F11 captures 20s; controller_mode=0 restores legacy");
+    log_line("0.2.34 narrower arrival blend; response model and stopping bounds unchanged; F11 captures 20s");
     lua.set_number(30);
     return 1;
 }

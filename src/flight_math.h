@@ -89,12 +89,14 @@ inline ArrivalOutput predictive_arrival(float error,float actual,float max_rate,
     const float delay_speed=deceleration*0.12f;
     const float safe=std::sqrt(delay_speed*delay_speed+2*deceleration*remaining)-delay_speed;
     const float linear=gain*remaining;
-    // Smooth minimum (power 4), including its derivative. A hard min would
-    // make acceleration feed-forward jump where linear/envelope curves meet.
-    auto blend_min=[](float x,float y) {
+    // Narrower smooth minimum (power 8, previously 4). It remains <= each
+    // bound, but avoids slowing far ahead of the actual stopping envelope.
+    // Keep its analytic derivative in sync; no hard min / acceleration jump.
+    constexpr float blend_power=8.0f;
+    auto blend_min=[blend_power](float x,float y) {
         if(x<=0 || y<=0) return 0.0f;
         const float lower_value=std::min(x,y),upper_value=std::max(x,y);
-        return lower_value/std::pow(1+std::pow(lower_value/upper_value,4.0f),0.25f);
+        return lower_value/std::pow(1+std::pow(lower_value/upper_value,blend_power),1.0f/blend_power);
     };
     const float curve=blend_min(linear,safe);
     const float wanted=blend_min(curve,max_rate);
@@ -105,7 +107,7 @@ inline ArrivalOutput predictive_arrival(float error,float actual,float max_rate,
     float slope=0;
     if(linear>1e-5f && safe>1e-5f && curve>1e-5f) {
         const float ds=deceleration/std::sqrt(delay_speed*delay_speed+2*deceleration*remaining);
-        slope=(std::pow(curve/linear,5.0f)*gain+std::pow(curve/safe,5.0f)*ds)*std::pow(wanted/curve,5.0f);
+        slope=(std::pow(curve/linear,blend_power+1)*gain+std::pow(curve/safe,blend_power+1)*ds)*std::pow(wanted/curve,blend_power+1);
     }
     slope*=gate*smooth_range(remaining,0,0.5f);
     const float toward=actual*sign>0?actual:0;
