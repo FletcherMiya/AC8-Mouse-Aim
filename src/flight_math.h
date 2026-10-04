@@ -47,19 +47,28 @@ struct LevelBlend {
     }
 };
 // Parameters describe an estimated input response, not changes to the flight model.
-inline float arrival_rate(float error,float max_rate,float deceleration,float gain,float zone) {
+inline float arrival_rate(float error,float max_rate,float deceleration,float gain,float zone,float delay=0.15f) {
     float distance=std::max(0.0f,std::abs(error)-zone);
-    float delay_speed=deceleration*0.15f;
+    float delay_speed=deceleration*delay;
     float stoppable=std::sqrt(delay_speed*delay_speed+2*deceleration*distance)-delay_speed;
     return std::copysign(std::min({max_rate,gain*distance,stoppable}),error);
 }
-inline float arrival_command(float error,float actual,float max_rate,float deceleration,
-                             float gain,float zone,float full_rate,float limit) {
-    float wanted=arrival_rate(error,max_rate,deceleration,gain,zone);
-    float command=wanted/full_rate+(wanted-actual)/full_rate;
+inline float rate_command(float wanted,float actual,float full_rate,float limit,
+                          float response_gain=1.0f,float countersteer_gain=1.0f/.65f) {
+    const bool reversing=actual*wanted<0;
+    float command=(wanted+(wanted-actual)*(reversing?countersteer_gain:response_gain))/full_rate;
     // When closing faster than the stopping envelope permits, actively counter-steer.
+    if(std::abs(wanted)<.001f || actual*std::copysign(1.0f,wanted)>std::abs(wanted)+3.0f)
+        command=(wanted-actual)*countersteer_gain/full_rate;
+    return std::clamp(command,-limit,limit);
+}
+inline float arrival_command(float error,float actual,float max_rate,float deceleration,
+                             float gain,float zone,float full_rate,float limit,float delay=0.15f) {
+    float wanted=arrival_rate(error,max_rate,deceleration,gain,zone,delay);
+    // Preserve the established dive/legacy response, including reversal gain.
+    float command=wanted/full_rate+(wanted-actual)/full_rate;
     if(std::abs(error)<=zone || actual*std::copysign(1.0f,error)>std::abs(wanted)+3.0f)
-        command=(wanted-actual)/(full_rate*0.65f);
+        command=(wanted-actual)/(full_rate*.65f);
     return std::clamp(command,-limit,limit);
 }
 }

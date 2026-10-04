@@ -1,0 +1,14 @@
+{
+  "lua": {
+    "version": "5.4.7",
+    "archive_url": "https://www.lua.org/ftp/lua-5.4.7.tar.gz",
+    "archive_sha256": "9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30",
+    "checksum_source": "https://www.lua.org/ftp/",
+    "headers_only": true
+  },
+  "ue4ss_common": {
+    "commit": "e3ba1016562d6c0868c410d0a71e88bfcdbf691b",
+    "url": "https://raw.githubusercontent.com/UE4SS-RE/RE-UE4SS/e3ba1016562d6c0868c410d0a71e88bfcdbf691b/deps/first/LuaMadeSimple/include/LuaMadeSimple/Common.hpp",
+    "sha256": "31f01abfcdddbbb1e82aba06636f20c8749460276900246799b0d0c0da13c846"
+  }
+}

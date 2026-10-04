@@ -1,4 +1,4 @@
--- 0.2.30: game-thread numeric bridge; no realtime files or named pipes.
+-- Local fork 0.2.30-pw.5; requires its matching native DLL (bridge 35).
 local directory = assert(debug.getinfo(1, "S").source:sub(2):match("^(.*[/\\])"))
 local aim_camera = dofile(directory .. "camera.lua")
 local gaze_probe = dofile(directory .. "gaze_probe.lua")
@@ -10,6 +10,8 @@ local frame_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll"
 local camera_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_camera"))
 local release_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_release"))
 local perf_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_perf"))
+local keys_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_keys"))
+local foreground_native = assert(package.loadlib(directory .. "ac8_mouse_aim_010.dll", "ac8_mouseaim_foreground"))
 local current_address = nil
 local startup_address, startup_time = nil, 0
 local next_search = 0
@@ -108,14 +110,24 @@ local function camera_rotation(manager, fallback)
     return fallback
 end
 
-RegisterKeyBind(Key.F10, function()
+assert(start_native(1729,0.125)==35,'AC8 local fork bridge unavailable or mismatched DLL/Lua (check native log).')
+local reload_key, probe_key, perf_key = keys_native()
+assert(reload_key and probe_key and perf_key, 'Native key configuration unavailable')
+-- The bridge returns lua_Number (float); UE4SS requires an actual Lua integer.
+local function keyboard_key(value)
+    local key = math.tointeger(value)
+    assert(key and key > 0 and key <= 255, 'Invalid native keyboard code')
+    return key
+end
+reload_key, probe_key, perf_key = keyboard_key(reload_key), keyboard_key(probe_key), keyboard_key(perf_key)
+
+RegisterKeyBind(reload_key, function()
+    if foreground_native() ~= 1 then return end
     local ok, err = pcall(reload_native)
     notice(ok and "Configuration reload queued for next game frame." or ("Reload failed: " .. tostring(err)))
 end)
-RegisterKeyBind(Key.F6, function() gaze_probe.request() end)
-RegisterKeyBind(Key.F5, function() perf_native() end)
-
-assert(start_native(1729,0.125)==30,'AC8 direct bridge unavailable; control disabled (check native log).')
+RegisterKeyBind(probe_key, function() if foreground_native() == 1 then gaze_probe.request() end end)
+RegisterKeyBind(perf_key, function() if foreground_native() == 1 then perf_native() end end)
 
 if EngineTickAvailable == false or type(LoopInGameThreadAfterFrames) ~= "function" then
     notice("Disabled: required game-thread callback unavailable.")

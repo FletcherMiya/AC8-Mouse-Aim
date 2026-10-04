@@ -1,2 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.ini text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.lua text eol=lf
+*.json text eol=lf
+*.ps1 text eol=crlf
+src/vendor/lua/* whitespace=-blank-at-eof
