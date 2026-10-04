@@ -1,30 +1,4 @@
-AC8 Mouse Aim 0.2.35 (lateral capture and roll tracking preview)
-
-Capture bank follows remaining lateral turn demand; roll tracks moving demand
-and predicts short-term response from measured angular acceleration. No online
-aircraft identification. Pitch/yaw braking core and camera/HUD are unchanged.
-F11 records bankDemand, bankTargetRate and predictedRollRate for comparison.
-
-Previous changes:
-
-Only narrows the smooth speed-envelope transition (power 4 to 8) and updates
-its derivative. Response estimates, stopping bounds and rollout coupling stay
-unchanged. To compare 0.2.33, close the game and reinstall its retained package.
-
-Stopping prediction and stick inversion share the same estimated axis response.
-Arrival-curve acceleration feed-forward and bounded rollout coupling added.
-Estimates come from one flight trace, not universal aircraft identification.
-
-All axes now anticipate stopping distance and smoothly remove feed-forward
-before actively braking. Attitude timing uses a high-resolution clock.
-F11 toggles a 20-second, up-to-20Hz asynchronous flight trace in Logs.
-Trace commands are automatic proposals, not final keyboard-overridden inputs.
-
-New controller default: coordinated bank/pull and bounded predictive roll-out.
-No near-target roll speed reduction; camera and HUD are unchanged.
-For the accepted legacy controller, set controller_mode=0 under [control] in
-config.ini and press F10. Set 1 to restore the new controller (also the default
-when the key is absent). Flight feel still needs in-game confirmation.
+AC8 Mouse Aim 0.1.0
 
 Offline single-player only. The mod reads aircraft attitude and replaces only
 the three player-control axes. It does not change aircraft physics, thrust,
