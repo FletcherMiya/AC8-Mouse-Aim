@@ -33,6 +33,7 @@ using Processor = uintptr_t(__fastcall*)(unsigned char*, unsigned char*);
 using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 
 struct Config {
+    int controller_mode = 1; // 0: accepted legacy controller; 1: coordinated guidance
     float sensitivity = 0.10f;
     float roll_gain = 0.022f;
     float pitch_gain = 0.026f;
@@ -87,6 +88,7 @@ std::atomic<bool> recenter_requested{true};
 float previous_pitch{}, previous_yaw{}, previous_roll{};
 float filtered_pitch_rate{}, filtered_yaw_rate{}, filtered_roll_rate{};
 flight::LevelBlend roll_level_blend;
+flight::CoordinatedGuidance coordinated_guidance;
 unsigned long long previous_pose_tick{}, telemetry_tick{};
 Config config;
 wchar_t module_folder[MAX_PATH]{};
@@ -135,6 +137,7 @@ int read_config_int(const wchar_t* key, int fallback) {
 
 void load_config() {
     init_paths();
+    config.controller_mode = std::clamp(read_config_int(L"controller_mode", 1), 0, 1);
     config.sensitivity = std::clamp(read_config_float(L"sensitivity", config.sensitivity), 0.01f, 1.0f);
     config.roll_gain = std::clamp(read_config_float(L"roll_gain", config.roll_gain), 0.001f, 0.2f);
     config.pitch_gain = std::clamp(read_config_float(L"pitch_gain", config.pitch_gain), 0.001f, 0.2f);
@@ -315,7 +318,10 @@ void update_commands() {
     // Estimate body angular velocity from the moving basis, avoiding Euler wrap/pole artifacts.
     V omega = (cross(old.f,b.f)+cross(old.r,b.r)+cross(old.u,b.u))*(0.5f/dt/rad);
     float a = 1-std::exp(-12*dt);
-    if (!previous_pose_tick) { omega={}; roll_level_blend.reset(); }
+    if (!previous_pose_tick) {
+        omega={}; roll_level_blend.reset(); coordinated_guidance.reset();
+        filtered_pitch_rate=filtered_yaw_rate=filtered_roll_rate=0;
+    }
     filtered_pitch_rate += (-dot(omega,b.r)-filtered_pitch_rate)*a;
     filtered_yaw_rate += (dot(omega,b.u)-filtered_yaw_rate)*a;
     filtered_roll_rate += (-dot(omega,b.f)-filtered_roll_rate)*a;
@@ -344,10 +350,18 @@ void update_commands() {
     target_pitch.store(flight::pitch(aim)); target_yaw.store(flight::yaw(aim));
     const float f=dot(aim,b.f), right=dot(aim,b.r), up=dot(aim,b.u);
     const float angle=std::acos(std::clamp(f,-1.0f,1.0f))/rad;
-    // Direct MouseFlight Plane.RunAutopilot port: normalized local target * 5.
+    // Legacy diagnostics: normalized local target * 5.
     // Unity (right, up, forward) -> Unreal (forward, right, up).
     // Positive UE Pitch raises the nose; positive UE Roll lowers the right wing.
     const float p=up*5.0f, y=right*5.0f;
+    float pcmd{},ycmd{},rcmd{},roll_error{},roll_blend{};
+    GuidanceOutput guidance;
+    if(config.controller_mode==1) {
+        guidance=coordinated_guidance.step(b,aim,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate);
+        pcmd=guidance.pitch; ycmd=guidance.yaw; rcmd=guidance.roll;
+        roll_error=guidance.bank_error;
+    } else {
+    // Accepted legacy controller is isolated: its limits never touch new output.
     // AC-specific rate-limited PD control. Body rates are degrees/second.
     // The reference proportional demand alone does not brake AC's fast roll response.
     const float pitch_error=std::atan2(up,std::max(0.02f,f))/rad;
@@ -356,23 +370,24 @@ void update_commands() {
     const float near_blend=tracking_weight(angle);
     // Bank until the target lies above the aircraft, then pull toward it.
     const float turn_bank_error=std::clamp(std::atan2(right,std::max(0.12f,up))/rad,-90.0f,90.0f);
-    const float roll_blend=roll_level_blend.step(angle,dt);
-    const float roll_error=level_error*(1-roll_blend)+turn_bank_error*roll_blend;
+    roll_blend=roll_level_blend.step(angle,dt);
+    roll_error=level_error*(1-roll_blend)+turn_bank_error*roll_blend;
     // Separate fast tracking from gentler final leveling. Braking remains available.
     const float roll_speed=70.0f+70.0f*roll_blend;
-    const float rcmd=arrival_command(roll_error,filtered_roll_rate,roll_speed,240.0f,3.5f,1.0f,170.0f,1.0f);
+    rcmd=arrival_command(roll_error,filtered_roll_rate,roll_speed,240.0f,3.5f,1.0f,170.0f,1.0f);
     const float final_gain=1.0f-near_blend;
-    const float pcmd=arrival_command(pitch_error,filtered_pitch_rate,45.0f,90.0f,1.8f+0.8f*final_gain,0.2f,55.0f,0.85f);
+    pcmd=arrival_command(pitch_error,filtered_pitch_rate,45.0f,90.0f,1.8f+0.8f*final_gain,0.2f,55.0f,0.85f);
     const float yaw_rate=std::clamp(dead(yaw_error,0.2f)*(1.2f+0.6f*final_gain),-7.0f,7.0f);
-    const float ycmd=std::clamp((yaw_rate-filtered_yaw_rate*0.6f)/10.0f,-0.7f,0.7f);
+    ycmd=std::clamp((yaw_rate-filtered_yaw_rate*0.6f)/10.0f,-0.7f,0.7f);
+    }
     command_pitch.store(manual?0:pcmd*config.pitch_sign);
     command_yaw.store(manual?0:ycmd*config.yaw_sign);
     command_roll.store(manual?0:rcmd*config.roll_sign);
     if(now-telemetry_tick>=10000) {
         telemetry_tick=now;
-        log_line("0.2.18 adaptive localScaled=(%.3f,%.3f) angle=%.1f roll=%.1f rollErrorDeg=%.3f bodyrate=(%.1f,%.1f,%.1f) cmd=(%.2f,%.2f,%.2f) rollBlend=%.3f leveling=%d",
-          p,y,angle,pose_roll.load(),roll_error,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
-          command_pitch.load(),command_yaw.load(),command_roll.load(),roll_blend,roll_level_blend.leveling);
+        log_line("0.2.31 mode=%d localScaled=(%.3f,%.3f) angle=%.1f roll=%.1f rollErrorDeg=%.3f bodyrate=(%.1f,%.1f,%.1f) cmd=(%.2f,%.2f,%.2f) turnWeight=%.3f leadScale=%.3f",
+          config.controller_mode,p,y,angle,pose_roll.load(),roll_error,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
+          command_pitch.load(),command_yaw.load(),command_roll.load(),config.controller_mode?guidance.turn_weight:roll_blend,guidance.lead_scale);
     }
 }
 #include "native_camera.h"
@@ -435,7 +450,7 @@ void draw_overlay(HWND window, HDC dc, const RECT& rect, uint32_t* pixels) {
         SetBkMode(dc,TRANSPARENT);
         SetTextColor(dc,RGB(245,245,245));
         char label[160]{};
-        snprintf(label,sizeof(label),"MouseFlight 0.2.30 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
+        snprintf(label,sizeof(label),"MouseFlight 0.2.31 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
             active.load() && enabled.load()?"ON":"STANDBY",
             target_pitch.load(),target_yaw.load(),camera_pitch.load(),camera_yaw.load());
         TextOutA(dc,28,40,label,static_cast<int>(strlen(label)));
@@ -805,7 +820,7 @@ extern "C" __declspec(dllexport) int ac8_mouseaim_start(lua_State* state) {
     std::thread(mouse_loop).detach();
     std::thread(overlay_loop).detach();
     log_line("ready: F8 toggle, F9 recenter; RMB reserved for game actions");
-    log_line("0.2.30 direct numeric bridge; realtime file/pipe transport removed; F5 performance counters");
+    log_line("0.2.31 coordinated guidance; controller_mode=0 restores legacy; camera/bridge unchanged");
     lua.set_number(30);
     return 1;
 }

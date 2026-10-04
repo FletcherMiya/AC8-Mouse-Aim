@@ -62,4 +62,65 @@ inline float arrival_command(float error,float actual,float max_rate,float decel
         command=(wanted-actual)/(full_rate*0.65f);
     return std::clamp(command,-limit,limit);
 }
+
+inline float smooth_range(float value,float low,float high) {
+    float t=std::clamp((value-low)/(high-low),0.0f,1.0f);
+    return t*t*(3-2*t);
+}
+inline float wrapped(float degrees) {
+    return std::remainder(degrees,360.0f);
+}
+struct GuidanceOutput {
+    float pitch{},yaw{},roll{},bank_error{},turn_weight{},lead_scale{1};
+};
+// AC input-response estimates, not aerodynamic forces. No integral or hidden
+// near-target output clamp. Reducing demand never reduces braking authority.
+inline float rate_command(float wanted,float actual,float full_rate) {
+    return std::clamp((2*wanted-actual)/full_rate,-1.0f,1.0f);
+}
+struct CoordinatedGuidance {
+    float turn_side=1;
+    void reset() { turn_side=1; }
+    GuidanceOutput step(Basis b,V aim,float pitch_rate,float yaw_rate,float roll_rate) {
+        GuidanceOutput out;
+        const float f=std::clamp(dot(aim,b.f),-1.0f,1.0f);
+        const float right=dot(aim,b.r),up=dot(aim,b.u);
+        const float tangent=std::sqrt(right*right+up*up);
+        const float angle=std::atan2(tangent,f)/rad;
+        // Only predict the aircraft's closing motion, not mouse target motion.
+        // Bound lead to 65% of remaining error: never reverse/erase real error.
+        const float closing=tangent>1e-5f ? (up*pitch_rate+right*yaw_rate)/tangent : 0;
+        const float lead=std::clamp(closing*0.18f,0.0f,angle*0.65f);
+        out.lead_scale=angle>1e-5f ? (angle-lead)/angle : 1;
+        const float predicted_angle=angle-lead;
+        const float level=std::atan2(b.r.z,b.u.z)/rad;
+        if(std::abs(right)>0.08f) turn_side=right>0?1.0f:-1.0f;
+        float turn=std::atan2(right,up)/rad;
+        // At the antipode the turn plane is undefined. Choose pull-up rather
+        // than returning zero on all axes. Hold turn side around the down seam.
+        if(tangent<1e-4f && f<0) turn=0;
+        else if(up<0 && std::abs(right)<0.08f)
+            turn=std::atan2(turn_side*std::abs(right),up)/rad;
+        out.turn_weight=smooth_range(predicted_angle,2.0f,18.0f);
+        // Modest below-nose requests can be pushed toward directly; do not
+        // command an inverted aircraft for a small downward cursor movement.
+        if(f>0 && up<0) out.turn_weight*=smooth_range(angle,25.0f,60.0f);
+        out.bank_error=wrapped(level+wrapped(turn-level)*out.turn_weight);
+        out.roll=rate_command(arrival_rate(out.bank_error,140,240,3.5f,0.35f),roll_rate,170);
+
+        // Pointing error is a tangent-plane rotation vector. Unlike atan2 with
+        // a positive-clamped forward component, it retains the rear hemisphere.
+        const float pe=tangent>1e-4f ? angle*up/tangent : (f<0?180.0f:0.0f);
+        const float ye=tangent>1e-4f ? angle*right/tangent : 0;
+        const float alignment=tangent>1e-4f ? std::max(0.0f,up/tangent) : 1;
+        const float gate=1-out.turn_weight*(1-alignment*alignment);
+        float pitch_wanted=arrival_rate(pe,45,90,2.6f,0.15f);
+        // Gate target rate, NOT stick output: counter-steering remains possible.
+        pitch_wanted*=gate;
+        out.pitch=rate_command(pitch_wanted,pitch_rate,55);
+        const float yaw_wanted=arrival_rate(ye,7,30,1.8f,0.15f);
+        out.yaw=rate_command(yaw_wanted,yaw_rate,14);
+        return out;
+    }
+};
 }

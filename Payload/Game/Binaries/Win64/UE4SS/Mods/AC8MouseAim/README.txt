@@ -1,4 +1,10 @@
-AC8 Mouse Aim 0.1.0
+AC8 Mouse Aim 0.2.31 (coordinated guidance preview)
+
+New controller default: coordinated bank/pull and bounded predictive roll-out.
+No near-target roll speed reduction; camera and HUD are unchanged.
+For the accepted legacy controller, set controller_mode=0 under [control] in
+config.ini and press F10. Set 1 to restore the new controller (also the default
+when the key is absent). Flight feel still needs in-game confirmation.
 
 Offline single-player only. The mod reads aircraft attitude and replaces only
 the three player-control axes. It does not change aircraft physics, thrust,
