@@ -90,6 +90,8 @@ float filtered_pitch_rate{}, filtered_yaw_rate{}, filtered_roll_rate{};
 flight::LevelBlend roll_level_blend;
 flight::CoordinatedGuidance coordinated_guidance;
 unsigned long long previous_pose_tick{}, telemetry_tick{};
+unsigned long long previous_pose_clock{},trace_tick{};
+std::atomic<unsigned long long> flight_trace_until{0};
 Config config;
 wchar_t module_folder[MAX_PATH]{};
 wchar_t status_path[MAX_PATH]{};
@@ -292,6 +294,15 @@ void mouse_loop() {
             log_line("HUD only: %s",hud_enabled.load()?"ON":"OFF");
         }
         f7_down=f7;
+        static bool f11_down=false;
+        const bool f11=(GetAsyncKeyState(VK_F11)&0x8000)!=0;
+        if(f11 && !f11_down && foreground_is_game()) {
+            const auto now=GetTickCount64();
+            const bool start=flight_trace_until.load()<=now;
+            flight_trace_until.store(start?now+20000:0);
+            log_line("FLIGHT_TRACE %s (20Hz, auto-stop after 20s; commands are proposed, keyboard mask indicates overrides)",start?"START":"STOP");
+        }
+        f11_down=f11;
         bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
         bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
         if (f8 && !f8_down) enabled.store(!enabled.load());
@@ -312,13 +323,17 @@ void update_commands() {
         return;
     }
     const auto now = GetTickCount64();
-    const float dt = previous_pose_tick ? std::clamp((now-previous_pose_tick)/1000.0f,0.001f,0.1f) : 1.0f/60;
+    const auto clock_now=perf_clock();
+    const double elapsed=previous_pose_tick ? double(clock_now-previous_pose_clock)/double(perf_frequency.QuadPart) : 1.0/60;
+    const bool fresh=!previous_pose_tick || elapsed>0.1;
+    const float dt=static_cast<float>(std::clamp(elapsed,0.0001,0.1));
+    previous_pose_clock=clock_now;
     const Basis b = basis(pose_pitch.load(),pose_yaw.load(),pose_roll.load());
     const Basis old = basis(previous_pitch,previous_yaw,previous_roll);
     // Estimate body angular velocity from the moving basis, avoiding Euler wrap/pole artifacts.
     V omega = (cross(old.f,b.f)+cross(old.r,b.r)+cross(old.u,b.u))*(0.5f/dt/rad);
     float a = 1-std::exp(-12*dt);
-    if (!previous_pose_tick) {
+    if (fresh) {
         omega={}; roll_level_blend.reset(); coordinated_guidance.reset();
         filtered_pitch_rate=filtered_yaw_rate=filtered_roll_rate=0;
     }
@@ -344,8 +359,9 @@ void update_commands() {
         filtered_pitch_rate=filtered_yaw_rate=filtered_roll_rate=0;
     }
     const bool looking=!manual && (GetAsyncKeyState('F')&0x8000)!=0;
+    const long dx=mouse_dx.exchange(0),dy=mouse_dy.exchange(0);
     const V camera_target=free_look.step(looking,aim,view,
-        mouse_dx.exchange(0)*config.sensitivity,mouse_dy.exchange(0)*config.sensitivity);
+        dx*config.sensitivity,dy*config.sensitivity);
     look_pitch.store(flight::pitch(camera_target)); look_yaw.store(flight::yaw(camera_target));
     target_pitch.store(flight::pitch(aim)); target_yaw.store(flight::yaw(aim));
     const float f=dot(aim,b.f), right=dot(aim,b.r), up=dot(aim,b.u);
@@ -383,9 +399,27 @@ void update_commands() {
     command_pitch.store(manual?0:pcmd*config.pitch_sign);
     command_yaw.store(manual?0:ycmd*config.yaw_sign);
     command_roll.store(manual?0:rcmd*config.roll_sign);
+    const auto trace_until=flight_trace_until.load();
+    if(trace_until && now>=trace_until) {
+        auto expected=trace_until;
+        if(flight_trace_until.compare_exchange_strong(expected,0)) log_line("FLIGHT_TRACE AUTO-STOP");
+    } else if(trace_until && now-trace_tick>=50) {
+        trace_tick=now;
+        unsigned keys=0;
+        const char* key_names="WASDQEF";
+        for(unsigned i=0;i<7;++i) if(GetAsyncKeyState(key_names[i])&0x8000) keys|=1u<<i;
+        log_line("FLIGHT mode=%d dt=%.5f mouse=(%ld,%ld) keys=%u foreground=%d pose=(%.3f,%.3f,%.3f) aim=(%.3f,%.3f) errorPYR=(%.3f,%.3f,%.3f) ratePYR=(%.3f,%.3f,%.3f) wantedPYR=(%.3f,%.3f,%.3f) stopPYR=(%.3f,%.3f,%.3f) brakePYR=(%.3f,%.3f,%.3f) proposedPYR=(%.4f,%.4f,%.4f) turn=%.3f accelPYR=(%.3f,%.3f,%.3f) couplingPY=(%.3f,%.3f)",
+            config.controller_mode,dt,dx,dy,keys,!manual,pose_pitch.load(),pose_yaw.load(),pose_roll.load(),target_pitch.load(),target_yaw.load(),
+            guidance.pitch_error,guidance.yaw_error,roll_error,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
+            guidance.pitch_arrival.wanted,guidance.yaw_arrival.wanted,guidance.roll_arrival.wanted,
+            guidance.pitch_arrival.stop_distance,guidance.yaw_arrival.stop_distance,guidance.roll_arrival.stop_distance,
+            guidance.pitch_arrival.brake,guidance.yaw_arrival.brake,guidance.roll_arrival.brake,pcmd,ycmd,rcmd,guidance.turn_weight,
+            guidance.pitch_arrival.acceleration,guidance.yaw_arrival.acceleration,guidance.roll_arrival.acceleration,
+            guidance.pitch_coupling,guidance.yaw_coupling);
+    }
     if(now-telemetry_tick>=10000) {
         telemetry_tick=now;
-        log_line("0.2.31 mode=%d localScaled=(%.3f,%.3f) angle=%.1f roll=%.1f rollErrorDeg=%.3f bodyrate=(%.1f,%.1f,%.1f) cmd=(%.2f,%.2f,%.2f) turnWeight=%.3f leadScale=%.3f",
+        log_line("0.2.33 mode=%d localScaled=(%.3f,%.3f) angle=%.1f roll=%.1f rollErrorDeg=%.3f bodyrate=(%.1f,%.1f,%.1f) cmd=(%.2f,%.2f,%.2f) turnWeight=%.3f leadScale=%.3f",
           config.controller_mode,p,y,angle,pose_roll.load(),roll_error,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
           command_pitch.load(),command_yaw.load(),command_roll.load(),config.controller_mode?guidance.turn_weight:roll_blend,guidance.lead_scale);
     }
@@ -450,7 +484,7 @@ void draw_overlay(HWND window, HDC dc, const RECT& rect, uint32_t* pixels) {
         SetBkMode(dc,TRANSPARENT);
         SetTextColor(dc,RGB(245,245,245));
         char label[160]{};
-        snprintf(label,sizeof(label),"MouseFlight 0.2.31 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
+        snprintf(label,sizeof(label),"MouseFlight 0.2.33 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
             active.load() && enabled.load()?"ON":"STANDBY",
             target_pitch.load(),target_yaw.load(),camera_pitch.load(),camera_yaw.load());
         TextOutA(dc,28,40,label,static_cast<int>(strlen(label)));
@@ -820,7 +854,7 @@ extern "C" __declspec(dllexport) int ac8_mouseaim_start(lua_State* state) {
     std::thread(mouse_loop).detach();
     std::thread(overlay_loop).detach();
     log_line("ready: F8 toggle, F9 recenter; RMB reserved for game actions");
-    log_line("0.2.31 coordinated guidance; controller_mode=0 restores legacy; camera/bridge unchanged");
+    log_line("0.2.33 response-matched braking and rollout coupling; F11 captures 20s; controller_mode=0 restores legacy");
     lua.set_number(30);
     return 1;
 }

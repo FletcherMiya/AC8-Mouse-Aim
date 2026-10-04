@@ -1,4 +1,13 @@
-AC8 Mouse Aim 0.2.31 (coordinated guidance preview)
+AC8 Mouse Aim 0.2.33 (response-matched braking preview)
+
+Stopping prediction and stick inversion share the same estimated axis response.
+Arrival-curve acceleration feed-forward and bounded rollout coupling added.
+Estimates come from one flight trace, not universal aircraft identification.
+
+All axes now anticipate stopping distance and smoothly remove feed-forward
+before actively braking. Attitude timing uses a high-resolution clock.
+F11 toggles a 20-second, up-to-20Hz asynchronous flight trace in Logs.
+Trace commands are automatic proposals, not final keyboard-overridden inputs.
 
 New controller default: coordinated bank/pull and bounded predictive roll-out.
 No near-target roll speed reduction; camera and HUD are unchanged.

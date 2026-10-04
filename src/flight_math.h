@@ -70,8 +70,55 @@ inline float smooth_range(float value,float low,float high) {
 inline float wrapped(float degrees) {
     return std::remainder(degrees,360.0f);
 }
+struct ArrivalOutput {
+    float command{},wanted{},stop_distance{},brake{};
+    float acceleration{};
+};
+// Local response estimate: rate_dot = authority * stick - damping * rate.
+// Both the stopping envelope and inverse input calculation use this SAME model.
+// 0.2.32 trace, low-bank/no-keyboard samples suggested pitch ~25*u - 0.2*rate;
+// this is an initial estimate, not a universal aircraft model or online learning.
+inline ArrivalOutput predictive_arrival(float error,float actual,float max_rate,
+        float authority,float gain,float zone,float damping,float gate=1) {
+    ArrivalOutput out;
+    const float deceleration=authority*0.85f; // Leave some input margin for coupling.
+    const float distance=std::max(0.0f,std::abs(error)-zone);
+    const float sign=std::copysign(1.0f,error);
+    const float closing=std::max(0.0f,actual*sign);
+    const float remaining=std::max(0.0f,distance-closing*0.08f);
+    const float delay_speed=deceleration*0.12f;
+    const float safe=std::sqrt(delay_speed*delay_speed+2*deceleration*remaining)-delay_speed;
+    const float linear=gain*remaining;
+    // Smooth minimum (power 4), including its derivative. A hard min would
+    // make acceleration feed-forward jump where linear/envelope curves meet.
+    auto blend_min=[](float x,float y) {
+        if(x<=0 || y<=0) return 0.0f;
+        const float lower_value=std::min(x,y),upper_value=std::max(x,y);
+        return lower_value/std::pow(1+std::pow(lower_value/upper_value,4.0f),0.25f);
+    };
+    const float curve=blend_min(linear,safe);
+    const float wanted=blend_min(curve,max_rate);
+    out.wanted=sign*wanted*gate;
+    out.stop_distance=closing*0.20f+closing*closing/(2*deceleration);
+    // Derivative of the arrival-rate curve: even when rate == wanted, the
+    // reference is slowing down. Old feedback alone supplied zero braking there.
+    float slope=0;
+    if(linear>1e-5f && safe>1e-5f && curve>1e-5f) {
+        const float ds=deceleration/std::sqrt(delay_speed*delay_speed+2*deceleration*remaining);
+        slope=(std::pow(curve/linear,5.0f)*gain+std::pow(curve/safe,5.0f)*ds)*std::pow(wanted/curve,5.0f);
+    }
+    slope*=gate*smooth_range(remaining,0,0.5f);
+    const float toward=actual*sign>0?actual:0;
+    out.acceleration=4.0f*(out.wanted-actual)-slope*toward;
+    out.command=std::clamp((out.acceleration+damping*actual)/authority,-1.0f,1.0f);
+    out.brake=std::clamp(-out.command*std::copysign(1.0f,actual),0.0f,1.0f);
+    return out;
+}
 struct GuidanceOutput {
     float pitch{},yaw{},roll{},bank_error{},turn_weight{},lead_scale{1};
+    float pitch_error{},yaw_error{};
+    float pitch_coupling{},yaw_coupling{};
+    ArrivalOutput pitch_arrival,yaw_arrival,roll_arrival;
 };
 // AC input-response estimates, not aerodynamic forces. No integral or hidden
 // near-target output clamp. Reducing demand never reduces braking authority.
@@ -106,7 +153,8 @@ struct CoordinatedGuidance {
         // command an inverted aircraft for a small downward cursor movement.
         if(f>0 && up<0) out.turn_weight*=smooth_range(angle,25.0f,60.0f);
         out.bank_error=wrapped(level+wrapped(turn-level)*out.turn_weight);
-        out.roll=rate_command(arrival_rate(out.bank_error,140,240,3.5f,0.35f),roll_rate,170);
+        out.roll_arrival=predictive_arrival(out.bank_error,roll_rate,140,220,3.5f,0.35f,1.5f);
+        out.roll=out.roll_arrival.command;
 
         // Pointing error is a tangent-plane rotation vector. Unlike atan2 with
         // a positive-clamped forward component, it retains the rear hemisphere.
@@ -114,12 +162,20 @@ struct CoordinatedGuidance {
         const float ye=tangent>1e-4f ? angle*right/tangent : 0;
         const float alignment=tangent>1e-4f ? std::max(0.0f,up/tangent) : 1;
         const float gate=1-out.turn_weight*(1-alignment*alignment);
-        float pitch_wanted=arrival_rate(pe,45,90,2.6f,0.15f);
+        out.pitch_error=pe; out.yaw_error=ye;
         // Gate target rate, NOT stick output: counter-steering remains possible.
-        pitch_wanted*=gate;
-        out.pitch=rate_command(pitch_wanted,pitch_rate,55);
-        const float yaw_wanted=arrival_rate(ye,7,30,1.8f,0.15f);
-        out.yaw=rate_command(yaw_wanted,yaw_rate,14);
+        out.pitch_arrival=predictive_arrival(pe,pitch_rate,45,25,2.0f,0.15f,0.2f,gate);
+        out.yaw_arrival=predictive_arrival(ye,yaw_rate,7,12,1.8f,0.15f,1.0f);
+        // Transport residual nose motion as the body rolls: p_dot += roll*y,
+        // y_dot -= roll*p. Apply only during rollout; preserve braking headroom.
+        const float rollout=1-out.turn_weight;
+        out.pitch_coupling=std::clamp(roll_rate*rad*yaw_rate*rollout,-15.0f,15.0f);
+        out.yaw_coupling=std::clamp(-roll_rate*rad*pitch_rate*rollout,-7.2f,7.2f);
+        // Compensation must not cancel an axis's existing braking demand.
+        if(out.pitch_arrival.command*pitch_rate<0 && out.pitch_coupling*pitch_rate>0) out.pitch_coupling=0;
+        if(out.yaw_arrival.command*yaw_rate<0 && out.yaw_coupling*yaw_rate>0) out.yaw_coupling=0;
+        out.pitch=std::clamp((out.pitch_arrival.acceleration+0.2f*pitch_rate+out.pitch_coupling)/25,-1.0f,1.0f);
+        out.yaw=std::clamp((out.yaw_arrival.acceleration+yaw_rate+out.yaw_coupling)/12,-1.0f,1.0f);
         return out;
     }
 };
