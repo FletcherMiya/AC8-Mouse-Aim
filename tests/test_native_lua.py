@@ -6,7 +6,7 @@ from lupa.lua54 import LuaRuntime
 SCRIPTS = Path(__file__).resolve().parents[1] / 'Payload/Game/Binaries/Win64/UE4SS/Mods/AC8MouseAim/Scripts'
 
 class NativeLuaTests(unittest.TestCase):
-    def environment(self, version=35):
+    def environment(self, version=41):
         lua = LuaRuntime(unpack_returned_tuples=True)
         lua.globals().bridge_version = version
         lua.execute('''
@@ -44,7 +44,7 @@ class NativeLuaTests(unittest.TestCase):
         self.assertIsNone(lua.globals().bindings[121]) # Old F10 is not registered.
 
     def test_original_dll_bridge_is_rejected(self):
-        for version in (30, 31, 32, 33, 34):
+        for version in (30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40):
             with self.subTest(version=version):
                 lua = self.environment(version)
                 with self.assertRaisesRegex(Exception, 'mismatched DLL/Lua'):

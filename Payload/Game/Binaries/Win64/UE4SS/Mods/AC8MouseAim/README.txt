@@ -1,13 +1,16 @@
-AC8 Mouse Aim 0.2.30-pw.5 contribution build (native/Lua bridge 35)
+AC8 Mouse Aim 0.2.30-pw.11 contribution build (native/Lua bridge 41)
 
 This flight-control version is tuned toward Project Wingman (PW)-style mouse
-handling, primarily through in-game testing with the F-14D. Defaults and the
-optional preset are starting points: adjust the parameters to suit your
-aircraft, flying style and personal preferences.
+handling. Adjust the parameters to suit your aircraft, flying style and
+personal preferences.
 
-Offline single-player only. The mod reads aircraft attitude and replaces only
-the three player-control axes. It does not change aircraft physics, thrust,
-lift, drag, weapon data, damage, or save files.
+Changes: steadier roll, fuller high-G pitch input (with a possible small offset
+when leveling out), and optional mouse-direction target priority that keeps
+native weapon eligibility, lock envelopes and multi-target behavior.
+
+Offline single-player only. The mod adjusts flight input, camera and optional
+target priority. It does not change aircraft physics, thrust, lift, drag,
+weapon data, damage, or save files.
 
 Controls
   Mouse      Move the world-space target marker; the aircraft follows it.
@@ -36,15 +39,16 @@ changing keys. Flight-axis and high-G keys must match the game's bindings.
 Control tuning can be reloaded with F10. High-G handling does not remove the
 game's native trigger delay or change aircraft performance.
 
-Default tuning: max_bank=85, roll_rate_scale=1.25, roll_lookahead=0.10,
-high_g_yaw_boost=0, diagnostics=0. presets/f14d-pw5.ini is an optional user
-preset (89, 1.35, 0.12, yaw boost and diagnostics enabled). Back up config.ini
-before merging preset values; keep your own sensitivity and key bindings.
+Packaged tuning: max_bank=89, roll_rate_scale=1.35, roll_lookahead=0.12,
+high_g_yaw_boost=1, diagnostics=1, angle_control=1, rollout_coordination=1.
+Target priority defaults off: set mouse_target_priority=1 to enable it.
+presets/f14d-pw11.ini enables this option with the same flight settings.
+Back up config.ini before merging values; keep your sensitivity and keys.
 The coexist installer preserves existing config.ini, including max_bank=65
 from older releases. Missing new settings use built-in defaults.
 
 Never mix this Lua entrypoint with an upstream/older native DLL. For detailed
-changes, configuration ranges and validation limits see docs/PW5.md in the
+changes, configuration ranges and validation limits see docs/PW11.md in the
 source repository. This is a contribution build, not an upstream release.
 
 Logs are written under AC8MouseAim\Logs. Game updates may require a rebuilt

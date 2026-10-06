@@ -2,7 +2,7 @@
 #include "bank_guidance.h"
 #include "response_settings.h"
 
-namespace flight {
+namespace pw7_reference {
 struct TurnDemand {
     float pitch_command{}, yaw_command{};
     float horizontal_rate{}, vertical_rate{}, pitch_rate{}, yaw_rate{};

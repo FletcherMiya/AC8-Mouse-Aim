@@ -1,14 +1,20 @@
+// Frozen pw.5 reference; never tune with production.
 #pragma once
-#include "bank_guidance.h"
+#include "pw5_bank_reference.h"
 #include "response_settings.h"
 
-namespace flight {
+namespace pw5_reference {
+using namespace flight;
 struct TurnDemand {
     float pitch_command{}, yaw_command{};
     float horizontal_rate{}, vertical_rate{}, pitch_rate{}, yaw_rate{};
     float roll_gate{}, rate_scale{}, roll_advance{}, allocation_blend{};
     float yaw_boost{};
 };
+inline float smooth_range(float value,float low,float high) {
+    const float t=std::clamp((value-low)/(high-low),0.0f,1.0f);
+    return t*t*(3-2*t);
+}
 inline float dive_pitch_command(float error,float actual,float final_gain,const ResponseSettings& cfg) {
     if(!cfg.high_g_requested) {
         // Release only the distant-target input cap. Keep the old arrival-rate

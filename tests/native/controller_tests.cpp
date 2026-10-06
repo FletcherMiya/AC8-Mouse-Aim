@@ -9,9 +9,10 @@
 #include "pw2_turn_reference.h"
 #include "pw3_turn_reference.h"
 using namespace flight;
+ResponseSettings legacy_response() { ResponseSettings c; c.angle_control=false; return c; }
 float angle_to(const Basis& b,V aim) { return std::acos(std::clamp(dot(b.f,aim),-1.0f,1.0f))/rad; }
 BankDemand demand(BankGuidance& g,Basis b,V aim,const BankSettings& c,float dt=1.f/60) {
-    return g.step(b,aim,angle_to(b,aim),dt,c);
+    return g.step(b,aim,angle_to(b,aim),dt,c,legacy_response());
 }
 void normal_and_recovery() {
     BankSettings c; c.max_bank=65;
@@ -79,7 +80,7 @@ void braking_response() {
         float roll=50, rate=speed, peak=roll; BankGuidance g; BankSettings c; c.max_bank=65;
         for (int i=0;i<int(8/dt);++i) {
             auto d=demand(g,basis(0,0,roll),basis(0,90,0).f,c,dt);
-            float cmd=roll_command(d,rate,ResponseSettings{});
+            float cmd=roll_command(d,rate,legacy_response());
             if (i==0 && speed==140) assert(cmd<0);
             rate += std::clamp((cmd*170-rate)/.15f,-500.f,500.f)*dt;
             roll+=rate*dt; peak=std::max(peak,roll);
@@ -150,7 +151,7 @@ void turn_dynamics() {
         for(int i=0;i<int(14/dt);++i) {
             const auto bank=demand(g,b,aim,cfg,dt);
             const auto turn=coordinated_turn(b,aim,bank,fq,fr,fs+horizon_roll_drift(b,fq,fr));
-            const float roll_cmd=roll_command(bank,fs,ResponseSettings{},horizon_roll_drift(b,fq,fr));
+            const float roll_cmd=roll_command(bank,fs,legacy_response(),horizon_roll_drift(b,fq,fr));
             const float response=1-std::exp(-dt/.15f);
             q+=(turn.pitch_command*55*pitch_gain-q)*response;
             r+=(turn.yaw_command*10-r)*response;
@@ -172,7 +173,7 @@ void turn_dynamics() {
     puts("PASS synthetic 3-axis turns at 30/60/144 Hz without climb/inversion");
 }
 void predictive_response() {
-    BankSettings c; BankGuidance g; ResponseSettings cfg;
+    BankSettings c; BankGuidance g; ResponseSettings cfg=legacy_response();
     const auto b=basis(0,0,50); const V aim=basis(0,60,0).f;
     const auto bank=demand(g,b,aim,c);
     const auto still=coordinated_turn(b,aim,bank,0,0,0,cfg);
@@ -202,7 +203,7 @@ void predictive_response() {
 }
 struct MotionResult { float settled,peak_pitch,peak_bank,error; };
 MotionResult simulate(bool previous,int maneuver,float dt,float lag,float pitch_gain,float yaw_gain,float roll_gain,float sign) {
-    Basis b=basis(0,0,0); BankSettings cfg; BankGuidance g; ResponseSettings response;
+    Basis b=basis(0,0,0); BankSettings cfg; BankGuidance g; ResponseSettings response=legacy_response();
     pw2_reference::BankSettings old_cfg; pw2_reference::BankGuidance old_g;
     float q=0,r=0,s=0,fq=0,fr=0,fs=0,max_pitch=0,max_bank=0,last_unsettled=0;
     V aim=basis(maneuver==3?25.f:0.f,maneuver==3?0.f:60*sign,0).f;
@@ -271,7 +272,7 @@ void diagonal_allocation() {
     pw3_reference::BankGuidance old_g; pw3_reference::BankSettings old_c;
     const auto old_bank=old_g.step(b,aim,angle_to(b,aim),1.f/60,old_c);
     const auto old=pw3_reference::coordinated_turn(b,aim,old_bank,.25f,4.67f,4.38f);
-    BankGuidance g; BankSettings c; ResponseSettings cfg;
+    BankGuidance g; BankSettings c; ResponseSettings cfg=legacy_response();
     const auto bank=g.step(b,aim,angle_to(b,aim),1.f/60,c,cfg);
     assert(old_bank.target<40 && old.rate_scale<.15f && std::abs(old.pitch_rate)<3);
     assert(bank.target>75); // Lift axis now points toward the requested path.
@@ -287,7 +288,7 @@ void diagonal_allocation() {
     cfg.high_g_requested=true; g.reset();
     auto hg_bank=g.step(basis(0,0,85),basis(0,90,0).f,90,1.f/60,c,cfg);
     auto high=coordinated_turn(basis(0,0,85),basis(0,90,0).f,hg_bank,65,0,0,cfg);
-    auto normal=coordinated_turn(basis(0,0,85),basis(0,90,0).f,hg_bank,65,0,0,ResponseSettings{});
+    auto normal=coordinated_turn(basis(0,0,85),basis(0,90,0).f,hg_bank,65,0,0,legacy_response());
     assert(high.pitch_rate>90 && high.pitch_command>.99f && normal.pitch_command<0);
     assert(dive_pitch_command(90,65,0,cfg)>.99f);
     input::Bindings keys;
@@ -302,7 +303,7 @@ struct DiagonalResult { float settle,error,peak_bank,peak_pitch_rate,peak_pitch;
 DiagonalResult diagonal_simulate(bool previous,float initial_pitch,float target_pitch,float target_yaw,
                                  float dt,float lag,float gain,int high_g_mode,bool yaw_boost=false,bool refinements=true) {
     Basis b=basis(initial_pitch,0,0); const V aim=basis(target_pitch,target_yaw,0).f;
-    BankGuidance g; BankSettings c; ResponseSettings cfg;
+    BankGuidance g; BankSettings c; ResponseSettings cfg=legacy_response();
     cfg.high_g_yaw_boost=yaw_boost; cfg.rear_turn_hold=cfg.dive_pitch_boost=refinements;
     pw3_reference::BankGuidance old_g; pw3_reference::BankSettings old_c;
     float q=0,r=0,s=0,fq=0,fr=0,fs=0,settle=0,peak_bank=0,peak_rate=0,peak_pitch=0;
@@ -315,7 +316,7 @@ DiagonalResult diagonal_simulate(bool previous,float initial_pitch,float target_
         if(previous) {
             const auto d=old_g.step(b,aim,angle,dt,old_c);
             const auto turn=pw3_reference::coordinated_turn(b,aim,d,fq,fr,fs);
-            pc=turn.pitch_command; yc=turn.yaw_command; rc=pw3_reference::roll_command(d,fs,ResponseSettings{});
+            pc=turn.pitch_command; yc=turn.yaw_command; rc=pw3_reference::roll_command(d,fs,legacy_response());
             if(d.diving) {
                 pc=arrival_command(std::atan2(dot(aim,b.u),std::max(.02f,dot(aim,b.f)))/rad,fq,45,90,1.8f+.8f*(1-tracking_weight(angle)),.2f,55,.85f);
                 const float ye=std::atan2(dot(aim,b.r),std::max(.02f,dot(aim,b.f)))/rad;
@@ -389,7 +390,7 @@ void rear_direction_regression() {
     // Fixed target from pw.4 log ticks 12141421/12141500/12141562.
     // Mirror the exact seam crossing to verify both turn directions.
     for(float side: {-1.f,1.f}) {
-        BankGuidance g,legacy; BankSettings c; ResponseSettings cfg,old;
+        BankGuidance g,legacy; BankSettings c; ResponseSettings cfg=legacy_response(),old=legacy_response();
         cfg.high_g_requested=old.high_g_requested=true; old.rear_turn_hold=false;
         const auto aim=basis(10.31f,48.44f*side,0).f;
         const Basis frames[]={basis(5.21f,-131.58f*side,-36.23f*side),
@@ -425,7 +426,7 @@ void rear_direction_regression() {
     puts("PASS logged rear-seam replay, mirrored direction, shared allocation, reversal/reset/pole exit");
 }
 void local_authority() {
-    ResponseSettings cfg,old; old.dive_pitch_boost=false;
+    ResponseSettings cfg=legacy_response(),old=legacy_response(); old.dive_pitch_boost=false;
     for(float side: {-1.f,1.f}) {
         assert(std::abs(dive_pitch_command(60*side,0,0,cfg)-side)<.001f);
         assert(std::abs(dive_pitch_command(60*side,0,0,old)-.85f*side)<.001f);

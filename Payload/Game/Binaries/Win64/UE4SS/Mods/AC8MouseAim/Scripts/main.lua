@@ -1,4 +1,4 @@
--- Local fork 0.2.30-pw.5; requires its matching native DLL (bridge 35).
+-- Local fork 0.2.30-pw.11; requires its matching native DLL (bridge 41).
 local directory = assert(debug.getinfo(1, "S").source:sub(2):match("^(.*[/\\])"))
 local aim_camera = dofile(directory .. "camera.lua")
 local gaze_probe = dofile(directory .. "gaze_probe.lua")
@@ -110,7 +110,7 @@ local function camera_rotation(manager, fallback)
     return fallback
 end
 
-assert(start_native(1729,0.125)==35,'AC8 local fork bridge unavailable or mismatched DLL/Lua (check native log).')
+assert(start_native(1729,0.125)==41,'AC8 local fork bridge unavailable or mismatched DLL/Lua (check native log).')
 local reload_key, probe_key, perf_key = keys_native()
 assert(reload_key and probe_key and perf_key, 'Native key configuration unavailable')
 -- The bridge returns lua_Number (float); UE4SS requires an actual Lua integer.

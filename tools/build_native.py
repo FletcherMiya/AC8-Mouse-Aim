@@ -69,11 +69,17 @@ def main():
                  f'/I{SRC}', f'/I{SRC / "vendor/ue4ss"}', f'/I{SRC / "vendor/lua"}']
     run(['cl.exe', *cpp_flags, ROOT/'tests/native/controller_tests.cpp', '/Fe:controller_tests.exe'], env)
     run([BUILD/'controller_tests.exe'], env)
+    run(['cl.exe', *cpp_flags, ROOT/'tests/native/angle_controller_tests.cpp', '/Fe:angle_controller_tests.exe'], env)
+    run([BUILD/'angle_controller_tests.exe'], env)
     from native_harness import generate
     generate(SRC/'mouse_aim.cpp', BUILD/'runtime_tests.cpp')
     run(['cl.exe', *cpp_flags, BUILD/'runtime_tests.cpp', '/Fe:runtime_tests.exe', 'user32.lib'], env)
-    run([BUILD/'runtime_tests.exe', MOD/'config.ini', MOD/'presets/f14d-pw5.ini'], env)
+    run([BUILD/'runtime_tests.exe', MOD/'config.ini', MOD/'presets/f14d-pw11.ini'], env)
+    run(['cl.exe', *cpp_flags, ROOT/'tests/native/target_selection_tests.cpp', '/Fe:target_selection_tests.exe'], env)
+    run([BUILD/'target_selection_tests.exe'], env)
     subprocess.run([sys.executable, str(ROOT/'tools/run_tests.py')], cwd=ROOT, check=True)
+    run(['cl.exe', *cpp_flags, ROOT/'tests/native/rollout_controller_tests.cpp', '/Fe:rollout_controller_tests.exe'], env)
+    run([BUILD/'rollout_controller_tests.exe'], env)
     if args.test_only:
         return
     version = re.search(r'AC8_MOUSE_AIM_VERSION "([0-9.]+-pw\.[0-9]+)"', (SRC/'version.h').read_text()).group(1)
@@ -120,11 +126,11 @@ END
     revision = subprocess.check_output([git, 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip() if git else None
     dirty = bool(subprocess.check_output([git, 'status', '--porcelain'], cwd=ROOT, text=True).strip()) if git else None
     sources = [p for p in SRC.rglob('*') if p.is_file()]
-    sources += list((MOD/'Scripts').glob('*.lua')) + [MOD/'config.ini', MOD/'presets/f14d-pw5.ini']
+    sources += list((MOD/'Scripts').glob('*.lua')) + [MOD/'config.ini', MOD/'presets/f14d-pw11.ini']
     sources += [p for folder in ('tools', 'tests') for p in (ROOT/folder).rglob('*')
                 if p.is_file() and p.suffix in ('.py', '.cpp', '.h')]
     sources += [ROOT/'requirements-dev.txt']
-    manifest = {'version': version, 'bridge_version': 35, 'source_commit': revision, 'working_tree_dirty': dirty,
+    manifest = {'version': version, 'bridge_version': int(re.search(r'AC8_MOUSE_AIM_BRIDGE ([0-9]+)', (SRC/'version.h').read_text()).group(1)), 'source_commit': revision, 'working_tree_dirty': dirty,
         'msvc': env.get('VCTOOLSVERSION'), 'windows_sdk': env.get('WINDOWSSDKVERSION'),
         'dll_sha256': sha(dll), 'payload_updated': args.update_payload,
         'source_sha256': {p.relative_to(ROOT).as_posix(): sha(p) for p in sorted(sources)}}

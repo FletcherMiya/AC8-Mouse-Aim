@@ -2,7 +2,7 @@
 #include "flight_math.h"
 #include "steering_plan.h"
 
-namespace flight {
+namespace pw7_reference {
 inline float wrap_angle(float value) {
     return std::remainder(value, 360.0f);
 }

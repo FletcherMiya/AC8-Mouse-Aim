@@ -1,12 +1,11 @@
 #pragma once
 #include <algorithm>
 
-namespace flight {
+namespace pw7_reference {
 // These tune input demands, not the game's aircraft performance. A rate scale
 // cannot make an aircraft attain a rate beyond its actual authority.
 struct ResponseSettings {
     bool angle_control = true;
-    bool rollout_coordination = true; // Separate rollout plus terminal pitch braking.
     float pitch_full_input_angle = 20.0f;
     float roll_full_input_angle = 45.0f;
     float turn_brake_lookahead = 0.10f;

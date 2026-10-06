@@ -1,8 +1,10 @@
+// Frozen pw.5 reference; never tune with production.
 #pragma once
 #include "flight_math.h"
 #include "steering_plan.h"
 
-namespace flight {
+namespace pw5_reference {
+using namespace flight;
 inline float wrap_angle(float value) {
     return std::remainder(value, 360.0f);
 }
@@ -17,7 +19,6 @@ struct BankDemand {
     float current{}, target{}, error{}, blend{};
     bool diving{};
     int rear_turn_sign{};
-    float roll_activity=1;
 };
 
 // The attitude setpoint is measured against the horizon, not against the
@@ -65,11 +66,6 @@ public:
         const float blend = leveling.step(angle, dt);
         const float right = dot(aim,reference_right), up = dot(aim,reference_up);
         float target;
-        // Existing bank keeps a committed turn responsive through arrival.
-        // Switching solely on remaining error would level early and close the
-        // pitch gate halfway through a large turn. Dives/poles retain authority.
-        const float roll_activity=response.angle_control && !diving && dot(horizon_right,horizon_right)>.03f ?
-            std::max(smooth_range(angle,8,30),smooth_range(std::abs(bank),25,60)) : 1;
         const int rear_direction=rear_turn.step(b,aim,response.rear_turn_hold && !diving);
         if (diving) {
             // A committed flip keeps its direction even when a nearly straight
@@ -80,8 +76,7 @@ public:
         } else {
             // Retain the small-turn softening; large level turns may bank
             // closer to side-on under the new cap, without demanding inversion.
-            const auto plan=response.angle_control ? angle_steering_plan(b,aim,rear_direction) :
-                steering_plan(b,aim,response,rear_direction);
+            const auto plan=steering_plan(b,aim,response,rear_direction);
             float bank_direction=std::atan2(right,std::max(0.12f,up))/rad;
             if(plan.valid) {
                 // On leaving a pole, the transported reference may still be
@@ -97,9 +92,7 @@ public:
                 const float soft=magnitude*(.12f-.08f*high_g_blend)/std::max(.01f,std::sin(std::min(angle,90.0f)*rad));
                 bank_direction=std::atan2(planned_right,std::max(soft,planned_up))/rad;
             }
-            const float small_bank=std::min(cfg.max_bank,response.roll_small_bank);
-            const float limit=response.angle_control ? small_bank+(cfg.max_bank-small_bank)*roll_activity : cfg.max_bank;
-            target = std::clamp(bank_direction,-limit,limit)*blend;
+            target = std::clamp(bank_direction,-cfg.max_bank,cfg.max_bank)*blend;
             // Return through upright instead of choosing a shorter route that
             // continues a roll across the inverted attitude. Retain that route
             // if inertia carries the measured angle across +/-180 degrees.
@@ -107,7 +100,7 @@ public:
             recovering = std::abs(bank) > 90;
             recovery_bank = bank;
         }
-        return {bank,target,target-bank,blend,diving,rear_direction,roll_activity};
+        return {bank,target,target-bank,blend,diving,rear_direction};
     }
 };
 }

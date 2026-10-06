@@ -2,7 +2,7 @@
 #include <cmath>
 #include <algorithm>
 // MouseFlight-inspired local-space guidance; Unreal axes: X forward, Y right, Z up.
-namespace flight {
+namespace pw7_reference {
 constexpr float rad = 0.017453292519943295f;
 struct V {
     float x{}, y{}, z{};

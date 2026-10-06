@@ -2,7 +2,7 @@
 #include "flight_math.h"
 #include "response_settings.h"
 
-namespace flight {
+namespace pw7_reference {
 struct SteeringPlan {
     float horizontal{}, vertical{}, elevation_error{};
     bool valid{};
