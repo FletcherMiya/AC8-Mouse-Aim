@@ -1,0 +1,3 @@
+Frozen pw.7 headers from 1e306a0d441b8d187a6057d8b418e3f55f0d8735.
+Only namespace flight renamed to pw7_reference for differential tests.
+Original code: CC0 1.0, see ../../../LICENSE.txt.

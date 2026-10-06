@@ -12,3 +12,10 @@ Copyright 2022 Narknon and contributors. MIT License. The loader binaries in
 the distribution retain their upstream license. Version:
 UE4SS_v3.0.1-1152-ge3ba1016 (experimental-latest), downloaded from the official
 UE4SS-RE/RE-UE4SS GitHub release.
+
+Local fork build additions (0.2.30-pw.1):
+Lua 5.4.7 public headers, Copyright (C) 1994-2024 Lua.org, PUC-Rio (MIT).
+Only headers are bundled; the fork does not link a second Lua runtime.
+License: src/vendor/lua/LICENSE.txt (Lua-LICENSE.txt in patch packages).
+LuaMadeSimple/Common.hpp from the matching UE4SS e3ba1016562d6c0868c410d0a71e88bfcdbf691b source.
+Pinned sources/checksums: src/vendor/BUILD_DEPENDENCIES.json.

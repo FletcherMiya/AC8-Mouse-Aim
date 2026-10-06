@@ -21,7 +21,16 @@
 #include "yaw_signature.h"
 #include "flight_math.h"
 #include "free_look.h"
+#include "bank_guidance.h"
+#include "turn_guidance.h"
+#include "angle_guidance.h"
+#include "rollout_coordination.h"
+#include "terminal_braking.h"
+#include "pose_guard.h"
+#include "key_bindings.h"
+#include "version.h"
 #include "lua_bridge.h"
+#include "native_target_selection.h"
 
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -32,14 +41,14 @@ namespace {
 using Processor = uintptr_t(__fastcall*)(unsigned char*, unsigned char*);
 using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 
-struct Config {
-    int controller_mode = 1; // 0: accepted legacy controller; 1: coordinated guidance
+struct Config : flight::BankSettings, flight::ResponseSettings {
     float sensitivity = 0.10f;
     float roll_gain = 0.022f;
     float pitch_gain = 0.026f;
     float yaw_gain = 0.012f;
     float turn_pull = 0.42f;
-    float max_bank = 65.0f;
+    bool diagnostics = false;
+    bool mouse_target_priority = false;
     float smoothing = 0.12f;
     float roll_damping = 0.008f;
     float pitch_damping = 0.010f;
@@ -87,12 +96,14 @@ flight::FreeLook free_look;
 std::atomic<bool> recenter_requested{true};
 float previous_pitch{}, previous_yaw{}, previous_roll{};
 float filtered_pitch_rate{}, filtered_yaw_rate{}, filtered_roll_rate{};
-flight::LevelBlend roll_level_blend;
-flight::CoordinatedGuidance coordinated_guidance;
+flight::BankGuidance bank_guidance;
+flight::HighGBraking high_g_braking;
+flight::RolloutCoordinator rollout_coordinator;
+flight::TerminalBraking terminal_braking;
+bool controller_reset_pending=false;
 unsigned long long previous_pose_tick{}, telemetry_tick{};
-unsigned long long previous_pose_clock{},trace_tick{};
-std::atomic<unsigned long long> flight_trace_until{0};
 Config config;
+input::Bindings key_bindings; // Immutable after start; shared with the mouse thread.
 wchar_t module_folder[MAX_PATH]{};
 wchar_t status_path[MAX_PATH]{};
 wchar_t config_path[MAX_PATH]{};
@@ -130,22 +141,81 @@ float read_config_float(const wchar_t* key, float fallback) {
     GetPrivateProfileStringW(L"control", key, fallback_text, value, 64, config_path);
     wchar_t* end{};
     float parsed = wcstof(value, &end);
-    return end != value && std::isfinite(parsed) ? parsed : fallback;
+    if (end==value) return fallback;
+    while (end && (*end==L' ' || *end==L'\t')) ++end;
+    return end != value && end && *end==0 && std::isfinite(parsed) ? parsed : fallback;
 }
 
 int read_config_int(const wchar_t* key, int fallback) {
     return GetPrivateProfileIntW(L"control", key, fallback, config_path);
 }
 
+float read_angle_setting(const wchar_t* key,float fallback,float low,float high) {
+    wchar_t value[64]{};
+    GetPrivateProfileStringW(L"control",key,L"",value,64,config_path);
+    if(!value[0]) return fallback;
+    wchar_t* end{};
+    const float parsed=wcstof(value,&end);
+    const bool converted=end!=value;
+    while(end && (*end==L' ' || *end==L'\t')) ++end;
+    if(!converted || !end || *end || !std::isfinite(parsed) || parsed<low || parsed>high) {
+        log_line("ANGLE_CONFIG invalid %ls; default=%.4f",key,fallback);
+        return fallback;
+    }
+    return parsed;
+}
+
 void load_config() {
     init_paths();
-    config.controller_mode = std::clamp(read_config_int(L"controller_mode", 1), 0, 1);
+    const float mouse_priority=read_angle_setting(L"mouse_target_priority",0,0,1);
+    config.mouse_target_priority=mouse_priority==1;
+    if(mouse_priority!=0&&mouse_priority!=1) log_line("TARGET_CONFIG invalid mouse_target_priority; default=0");
+    log_line("TARGET_CONFIG mouse_target_priority=%d (PW flight aim; all weapons, short release)",config.mouse_target_priority);
+    const bool old_angle_control=config.angle_control;
+    const bool old_rollout=config.rollout_coordination;
+    const float mode=read_angle_setting(L"angle_control",1,0,1);
+    config.angle_control=mode!=0;
+    if(mode!=0 && mode!=1) log_line("ANGLE_CONFIG invalid angle_control; default=1");
+    const float rollout=read_angle_setting(L"rollout_coordination",1,0,1);
+    config.rollout_coordination=rollout!=0;
+    if(rollout!=0 && rollout!=1) log_line("ANGLE_CONFIG invalid rollout_coordination; default=1");
+    if(running.load() && old_rollout!=config.rollout_coordination) controller_reset_pending=true;
+    config.pitch_full_input_angle=read_angle_setting(L"pitch_full_input_angle",20,5,90);
+    config.roll_full_input_angle=read_angle_setting(L"roll_full_input_angle",45,10,120);
+    config.turn_brake_lookahead=read_angle_setting(L"turn_brake_lookahead",.10f,0,.6f);
+    config.roll_brake_lookahead=read_angle_setting(L"roll_brake_lookahead",.25f,0,.6f);
+    config.angle_pitch_yaw_ratio=read_angle_setting(L"angle_pitch_yaw_ratio",5.5f,1,30);
+    config.angle_high_g_pitch_yaw_ratio=read_angle_setting(L"angle_high_g_pitch_yaw_ratio",11,1,30);
+    config.roll_small_input_scale=read_angle_setting(L"roll_small_input_scale",.50f,.2f,1);
+    config.roll_large_input_scale=read_angle_setting(L"roll_large_input_scale",1.35f,1,2);
+    config.roll_small_bank=read_angle_setting(L"roll_small_bank",25,10,89);
+    config.roll_brake_gain=read_angle_setting(L"roll_brake_gain",1.5f,1,3);
+    config.high_g_brake_lookahead=read_angle_setting(L"high_g_brake_lookahead",.30f,0,.6f);
+    config.high_g_brake_gain=read_angle_setting(L"high_g_brake_gain",1.5f,1,3);
+    config.high_g_brake_hold=read_angle_setting(L"high_g_brake_hold",.45f,0,1);
+    config.high_g_pitch_priority=read_angle_setting(L"high_g_pitch_priority",1,0,1);
+    if(running.load() && old_angle_control!=config.angle_control) controller_reset_pending=true;
     config.sensitivity = std::clamp(read_config_float(L"sensitivity", config.sensitivity), 0.01f, 1.0f);
     config.roll_gain = std::clamp(read_config_float(L"roll_gain", config.roll_gain), 0.001f, 0.2f);
     config.pitch_gain = std::clamp(read_config_float(L"pitch_gain", config.pitch_gain), 0.001f, 0.2f);
     config.yaw_gain = std::clamp(read_config_float(L"yaw_gain", config.yaw_gain), 0.0f, 0.2f);
     config.turn_pull = std::clamp(read_config_float(L"turn_pull", config.turn_pull), 0.0f, 1.0f);
     config.max_bank = std::clamp(read_config_float(L"max_bank", config.max_bank), 20.0f, 89.0f);
+    config.turn_rate_scale = std::clamp(read_config_float(L"turn_rate_scale", config.turn_rate_scale), 0.7f, 1.4f);
+    config.roll_rate_scale = std::clamp(read_config_float(L"roll_rate_scale", config.roll_rate_scale), 0.7f, 1.4f);
+    config.response_gain = std::clamp(read_config_float(L"response_gain", config.response_gain), 0.8f, 1.6f);
+    config.countersteer_gain = std::clamp(read_config_float(L"countersteer_gain", config.countersteer_gain), 1.0f, 3.0f);
+    config.roll_lookahead = std::clamp(read_config_float(L"roll_lookahead", config.roll_lookahead), 0.0f, 0.15f);
+    config.high_g_enabled = read_config_int(L"high_g_enabled", config.high_g_enabled) != 0;
+    config.high_g_pitch_rate = std::clamp(read_config_float(L"high_g_pitch_rate", config.high_g_pitch_rate), 54.0f, 140.0f);
+    config.rear_turn_hold = read_config_int(L"rear_turn_hold", config.rear_turn_hold) != 0;
+    config.dive_pitch_boost = read_config_int(L"dive_pitch_boost", config.dive_pitch_boost) != 0;
+    config.high_g_yaw_boost = read_config_int(L"high_g_yaw_boost", config.high_g_yaw_boost) != 0;
+    config.allow_dive_inversion = read_config_int(L"allow_dive_inversion", config.allow_dive_inversion) != 0;
+    config.dive_enter_pitch = std::clamp(read_config_float(L"dive_enter_pitch", config.dive_enter_pitch), -89.0f, -20.0f);
+    config.dive_enter_delta = std::clamp(read_config_float(L"dive_enter_delta", config.dive_enter_delta), 5.0f, 80.0f);
+    config.dive_exit_pitch = std::clamp(read_config_float(L"dive_exit_pitch", config.dive_exit_pitch), config.dive_enter_pitch+5.0f, 0.0f);
+    config.diagnostics = read_config_int(L"diagnostics", config.diagnostics) != 0;
     config.smoothing = std::clamp(read_config_float(L"smoothing", config.smoothing), 0.02f, 1.0f);
     config.roll_damping = std::clamp(read_config_float(L"roll_damping", config.roll_damping), 0.0f, 0.05f);
     config.pitch_damping = std::clamp(read_config_float(L"pitch_damping", config.pitch_damping), 0.0f, 0.05f);
@@ -162,6 +232,47 @@ void load_config() {
         config.pitch_slot = 0;
         config.roll_slot = 2;
     }
+    input::Bindings candidate;
+    bool valid = true;
+    for (const auto& field: input::fields) {
+        wchar_t value[128]{};
+        GetPrivateProfileStringW(L"keys",field.name,field.fallback,value,128,config_path);
+        if (!input::parse_field(candidate,field,value)) {
+            log_line("KEYS invalid name/count in %ls; using full default key set",field.name);
+            valid = false;
+        }
+    }
+    if (valid && !input::unique(candidate)) {
+        log_line("KEYS duplicate/overlapping bindings; using full default key set");
+        valid = false;
+    }
+    if (!valid) candidate = input::Bindings{};
+    if (!running.load()) {
+        key_bindings = candidate;
+        log_line("KEYS active VK pitch=%d,%d roll=%d,%d yaw=%d,%d look=%d hud=%d enabled=%d center=%d reload=%d gaze=%d perf=%d",
+            candidate[input::Pitch1],candidate[input::Pitch2],candidate[input::Roll1],candidate[input::Roll2],
+            candidate[input::Yaw1],candidate[input::Yaw2],candidate[input::FreeLook],candidate[input::ToggleHud],
+            candidate[input::ToggleEnabled],candidate[input::Recenter],candidate[input::Reload],candidate[input::GazeProbe],candidate[input::Perf]);
+        log_line("KEYS highG VK=%d,%d (both held; observation only)",candidate[input::HighG1],candidate[input::HighG2]);
+    } else if (!(candidate == key_bindings)) {
+        log_line("KEYS changed: restart game to apply; active bindings unchanged");
+    }
+    bank_guidance.reset(); high_g_braking.reset(); rollout_coordinator.reset(); terminal_braking.reset();
+    log_line("ROLLOUT_CONFIG enabled=%d (roll target decoupled; near-target reverse braking; pw.7 high-G state preserved)",config.rollout_coordination);
+    log_line("ANGLE_CONFIG enabled=%d pitchAngle=%.2f rollAngle=%.2f turnBrake=%.3f rollBrake=%.3f ratio=%.2f highGRatio=%.2f (rate settings apply only to legacy controller)",
+        config.angle_control,config.pitch_full_input_angle,config.roll_full_input_angle,
+        config.turn_brake_lookahead,config.roll_brake_lookahead,config.angle_pitch_yaw_ratio,config.angle_high_g_pitch_yaw_ratio);
+    log_line("CONTROL max_bank=%.1f dive=%d enter=%.1f delta=%.1f exit=%.1f diagnostics=%d",
+        config.max_bank,config.allow_dive_inversion,config.dive_enter_pitch,
+        config.dive_enter_delta,config.dive_exit_pitch,config.diagnostics);
+    log_line("RESPONSE turnScale=%.2f rollScale=%.2f responseGain=%.2f countersteerGain=%.2f rollLookahead=%.3f",
+        config.turn_rate_scale,config.roll_rate_scale,config.response_gain,config.countersteer_gain,config.roll_lookahead);
+    log_line("HIGH_G enabled=%d pitchRate=%.1f (key request, not game activation)",config.high_g_enabled,config.high_g_pitch_rate);
+    log_line("ANGLE_RESPONSE smallRoll=%.2f largeRoll=%.2f smallBank=%.1f rollBrakeGain=%.2f highGBrake=%.3f highGBrakeGain=%.2f highGBrakeHold=%.3f highGPitchPriority=%.2f",
+        config.roll_small_input_scale,config.roll_large_input_scale,config.roll_small_bank,config.roll_brake_gain,
+        config.high_g_brake_lookahead,config.high_g_brake_gain,config.high_g_brake_hold,config.high_g_pitch_priority);
+    log_line("REFINEMENTS rearTurnHold=%d divePitchBoost=%d highGYawBoost=%d",
+        config.rear_turn_hold,config.dive_pitch_boost,config.high_g_yaw_boost);
 }
 
 struct WindowCandidate {
@@ -288,25 +399,17 @@ void mouse_loop() {
             }
         }
         static bool f7_down=false;
-        bool f7=(GetAsyncKeyState(VK_F7)&0x8000)!=0;
-        if(f7 && !f7_down && foreground_is_game()) {
+        const bool foreground=foreground_is_game();
+        bool f7=(GetAsyncKeyState(key_bindings[input::ToggleHud])&0x8000)!=0;
+        if(f7 && !f7_down && foreground) {
             hud_enabled.store(!hud_enabled.load());
             log_line("HUD only: %s",hud_enabled.load()?"ON":"OFF");
         }
         f7_down=f7;
-        static bool f11_down=false;
-        const bool f11=(GetAsyncKeyState(VK_F11)&0x8000)!=0;
-        if(f11 && !f11_down && foreground_is_game()) {
-            const auto now=GetTickCount64();
-            const bool start=flight_trace_until.load()<=now;
-            flight_trace_until.store(start?now+20000:0);
-            log_line("FLIGHT_TRACE %s (20Hz, auto-stop after 20s; commands are proposed, keyboard mask indicates overrides)",start?"START":"STOP");
-        }
-        f11_down=f11;
-        bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-        bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-        if (f8 && !f8_down) enabled.store(!enabled.load());
-        if (f9 && !f9_down) recenter_requested.store(true);
+        bool f8 = (GetAsyncKeyState(key_bindings[input::ToggleEnabled]) & 0x8000) != 0;
+        bool f9 = (GetAsyncKeyState(key_bindings[input::Recenter]) & 0x8000) != 0;
+        if (f8 && !f8_down && foreground) enabled.store(!enabled.load());
+        if (f9 && !f9_down && foreground) recenter_requested.store(true);
         f8_down = f8;
         f9_down = f9;
         Sleep(4);
@@ -317,24 +420,47 @@ void update_commands() {
     using namespace flight;
     if (!active.load() || !enabled.load() || game_paused.load() || gaze_active.load()) {
         free_look.reset();
+        high_g_braking.reset(); rollout_coordinator.reset(); terminal_braking.reset();
         command_pitch.store(0); command_roll.store(0); command_yaw.store(0);
         if(game_paused.load() || gaze_active.load()) { mouse_dx.store(0); mouse_dy.store(0); }
         previous_pose_tick = 0;
         return;
     }
     const auto now = GetTickCount64();
-    const auto clock_now=perf_clock();
-    const double elapsed=previous_pose_tick ? double(clock_now-previous_pose_clock)/double(perf_frequency.QuadPart) : 1.0/60;
-    const bool fresh=!previous_pose_tick || elapsed>0.1;
-    const float dt=static_cast<float>(std::clamp(elapsed,0.0001,0.1));
-    previous_pose_clock=clock_now;
+    const float dt = previous_pose_tick ? std::clamp((now-previous_pose_tick)/1000.0f,0.001f,0.1f) : 1.0f/60;
     const Basis b = basis(pose_pitch.load(),pose_yaw.load(),pose_roll.load());
     const Basis old = basis(previous_pitch,previous_yaw,previous_roll);
+    if(controller_reset_pending) {
+        controller_reset_pending=false;
+        bank_guidance.reset(); high_g_braking.reset(); rollout_coordinator.reset(); terminal_braking.reset(); filtered_pitch_rate=filtered_yaw_rate=filtered_roll_rate=0;
+        previous_pitch=pose_pitch.load(); previous_yaw=pose_yaw.load(); previous_roll=pose_roll.load();
+        previous_pose_tick=now;
+        command_pitch.store(0); command_roll.store(0); command_yaw.store(0);
+        log_line("CONTROLLER_RESET angle=%d; target retained, one update neutral",config.angle_control);
+        return;
+    }
+    const float elapsed=previous_pose_tick ? (now-previous_pose_tick)/1000.0f : 0;
+    const bool pose_jump=previous_pose_tick && pose_discontinuity(old,b,elapsed);
+    if(previous_pose_tick && (elapsed>.25f || pose_jump)) {
+        filtered_pitch_rate=filtered_yaw_rate=filtered_roll_rate=0;
+        bank_guidance.reset(); high_g_braking.reset(); rollout_coordinator.reset(); terminal_braking.reset(); free_look.reset();
+        previous_pitch=pose_pitch.load(); previous_yaw=pose_yaw.load(); previous_roll=pose_roll.load();
+        previous_pose_tick=now;
+        if(pose_jump) {
+            target_pitch.store(flight::pitch(b.f)); target_yaw.store(flight::yaw(b.f));
+            look_pitch.store(flight::pitch(b.f)); look_yaw.store(flight::yaw(b.f));
+        }
+        mouse_dx.store(0); mouse_dy.store(0);
+        command_pitch.store(0); command_roll.store(0); command_yaw.store(0);
+        log_line("POSE_RESET reason=%s elapsed=%.3f; rates reset, one update neutral",
+            pose_jump ? "discontinuity" : "gap",elapsed);
+        return;
+    }
     // Estimate body angular velocity from the moving basis, avoiding Euler wrap/pole artifacts.
     V omega = (cross(old.f,b.f)+cross(old.r,b.r)+cross(old.u,b.u))*(0.5f/dt/rad);
     float a = 1-std::exp(-12*dt);
-    if (fresh) {
-        omega={}; roll_level_blend.reset(); coordinated_guidance.reset();
+    if (!previous_pose_tick) {
+        omega={}; bank_guidance.reset(); high_g_braking.reset(); rollout_coordinator.reset(); terminal_braking.reset();
         filtered_pitch_rate=filtered_yaw_rate=filtered_roll_rate=0;
     }
     filtered_pitch_rate += (-dot(omega,b.r)-filtered_pitch_rate)*a;
@@ -345,13 +471,12 @@ void update_commands() {
     V aim=basis(target_pitch.load(),target_yaw.load(),0).f;
     const bool manual = !foreground_is_game();
     if (recenter_requested.exchange(false) || manual) {
+        bank_guidance.reset(); high_g_braking.reset(); rollout_coordinator.reset(); terminal_braking.reset();
         aim=b.f;
-        coordinated_guidance.reset();
         mouse_dx.store(0); mouse_dy.store(0);
     }
     const Basis view=basis(camera_pitch.load(),camera_yaw.load(),camera_roll.load());
     if(resume_center_requested.exchange(false)) {
-        coordinated_guidance.reset();
         // Intersect the camera-centre ray with the HUD's 500m aim sphere.
         V offset{view_offset_x.load(),view_offset_y.load(),view_offset_z.load()};
         const float along=dot(offset,view.f);
@@ -360,72 +485,81 @@ void update_commands() {
         mouse_dx.store(0); mouse_dy.store(0);
         filtered_pitch_rate=filtered_yaw_rate=filtered_roll_rate=0;
     }
-    const bool looking=!manual && (GetAsyncKeyState('F')&0x8000)!=0;
-    const long dx=mouse_dx.exchange(0),dy=mouse_dy.exchange(0);
+    const bool looking=!manual && (GetAsyncKeyState(key_bindings[input::FreeLook])&0x8000)!=0;
+    const long frame_dx=mouse_dx.exchange(0), frame_dy=mouse_dy.exchange(0);
     const V camera_target=free_look.step(looking,aim,view,
-        dx*config.sensitivity,dy*config.sensitivity);
+        frame_dx*config.sensitivity,frame_dy*config.sensitivity);
     look_pitch.store(flight::pitch(camera_target)); look_yaw.store(flight::yaw(camera_target));
     target_pitch.store(flight::pitch(aim)); target_yaw.store(flight::yaw(aim));
     const float f=dot(aim,b.f), right=dot(aim,b.r), up=dot(aim,b.u);
     const float angle=std::acos(std::clamp(f,-1.0f,1.0f))/rad;
-    // Legacy diagnostics: normalized local target * 5.
-    // Unity (right, up, forward) -> Unreal (forward, right, up).
-    // Positive UE Pitch raises the nose; positive UE Roll lowers the right wing.
-    const float p=up*5.0f, y=right*5.0f;
-    float pcmd{},ycmd{},rcmd{},roll_error{},roll_blend{};
-    GuidanceOutput guidance;
-    if(config.controller_mode==1) {
-        const bool roll_manual=manual || (GetAsyncKeyState('W')&0x8000) || (GetAsyncKeyState('S')&0x8000) ||
-            (GetAsyncKeyState('A')&0x8000) || (GetAsyncKeyState('D')&0x8000);
-        guidance=coordinated_guidance.step(b,aim,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,roll_manual?0:dt);
-        pcmd=guidance.pitch; ycmd=guidance.yaw; rcmd=guidance.roll;
-        roll_error=guidance.bank_error;
-    } else {
-    // Accepted legacy controller is isolated: its limits never touch new output.
     // AC-specific rate-limited PD control. Body rates are degrees/second.
     // The reference proportional demand alone does not brake AC's fast roll response.
     const float pitch_error=std::atan2(up,std::max(0.02f,f))/rad;
     const float yaw_error=std::atan2(right,std::max(0.02f,f))/rad;
-    const float level_error=std::atan2(b.r.z,b.u.z)/rad;
     const float near_blend=tracking_weight(angle);
-    // Bank until the target lies above the aircraft, then pull toward it.
-    const float turn_bank_error=std::clamp(std::atan2(right,std::max(0.12f,up))/rad,-90.0f,90.0f);
-    roll_blend=roll_level_blend.step(angle,dt);
-    roll_error=level_error*(1-roll_blend)+turn_bank_error*roll_blend;
+    const auto manual_axes=input::manual_axes(key_bindings,[](int key) { return (GetAsyncKeyState(key)&0x8000)!=0; });
+    // Do not accumulate a multi-turn recovery route while the pilot is rolling.
+    if (manual_axes.roll) { bank_guidance.reset(); high_g_braking.reset(); rollout_coordinator.reset(); terminal_braking.reset(); }
+    ResponseSettings response=config;
+    response.high_g_requested=config.high_g_enabled && !manual && input::high_g_requested(key_bindings,
+        [](int key) { return (GetAsyncKeyState(key)&0x8000)!=0; });
+    if(!response.angle_control || !config.high_g_enabled || manual) high_g_braking.reset();
+    response.high_g_brake_weight=response.angle_control && config.high_g_enabled && !manual ?
+        high_g_braking.step(response.high_g_requested,dt,response.high_g_brake_hold,angle,filtered_pitch_rate) : 0;
+    response.high_g_settling=high_g_braking.settling();
+    const auto bank=bank_guidance.step(b,aim,angle,dt,config,response);
+    // Keep bank immutable: pitch/yaw must never see a held or eased roll target.
+    const bool coordinate=response.angle_control && response.rollout_coordination && !manual &&
+        !manual_axes.pitch && !manual_axes.yaw && !manual_axes.roll;
+    if(!coordinate) terminal_braking.reset();
+    const auto rollout=rollout_coordinator.step(b,aim,bank,filtered_pitch_rate,filtered_yaw_rate,dt,coordinate);
     // Separate fast tracking from gentler final leveling. Braking remains available.
-    const float roll_speed=70.0f+70.0f*roll_blend;
-    rcmd=arrival_command(roll_error,filtered_roll_rate,roll_speed,240.0f,3.5f,1.0f,170.0f,1.0f);
-    const float final_gain=1.0f-near_blend;
-    pcmd=arrival_command(pitch_error,filtered_pitch_rate,45.0f,90.0f,1.8f+0.8f*final_gain,0.2f,55.0f,0.85f);
-    const float yaw_rate=std::clamp(dead(yaw_error,0.2f)*(1.2f+0.6f*final_gain),-7.0f,7.0f);
-    ycmd=std::clamp((yaw_rate-filtered_yaw_rate*0.6f)/10.0f,-0.7f,0.7f);
+    const float roll_drift=horizon_roll_drift(b,filtered_pitch_rate,filtered_yaw_rate);
+    AngleTurnDemand angular_turn;
+    AngleAxisDemand angular_roll;
+    TurnDemand turn;
+    float pcmd{},ycmd{},rcmd{};
+    if(response.angle_control) {
+        angular_turn=angle_turn(b,aim,bank,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate+roll_drift,response);
+        angular_roll=angle_roll(rollout.bank,filtered_roll_rate,response,roll_drift);
+        pcmd=coordinate ? terminal_braking.step(b,aim,bank,filtered_pitch_rate,angular_turn,response,dt) : angular_turn.pitch.command;
+        ycmd=angular_turn.yaw.command; rcmd=angular_roll.command;
+    } else {
+        rcmd=roll_command(bank,filtered_roll_rate,response,roll_drift);
+        const float final_gain=1.0f-near_blend;
+        turn=coordinated_turn(b,aim,bank,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate+roll_drift,response);
+        pcmd=bank.diving ? dive_pitch_command(pitch_error,filtered_pitch_rate,final_gain,response) : turn.pitch_command;
+        const float yaw_rate=std::clamp(dead(yaw_error,0.2f)*(1.2f+0.6f*final_gain),-7.0f,7.0f);
+        ycmd=bank.diving ? std::clamp((yaw_rate-filtered_yaw_rate*0.6f)/10.0f,-0.7f,0.7f) : turn.yaw_command;
     }
     command_pitch.store(manual?0:pcmd*config.pitch_sign);
     command_yaw.store(manual?0:ycmd*config.yaw_sign);
     command_roll.store(manual?0:rcmd*config.roll_sign);
-    const auto trace_until=flight_trace_until.load();
-    if(trace_until && now>=trace_until) {
-        auto expected=trace_until;
-        if(flight_trace_until.compare_exchange_strong(expected,0)) log_line("FLIGHT_TRACE AUTO-STOP");
-    } else if(trace_until && now-trace_tick>=50) {
-        trace_tick=now;
-        unsigned keys=0;
-        const char* key_names="WASDQEF";
-        for(unsigned i=0;i<7;++i) if(GetAsyncKeyState(key_names[i])&0x8000) keys|=1u<<i;
-        log_line("FLIGHT mode=%d dt=%.5f mouse=(%ld,%ld) keys=%u foreground=%d pose=(%.3f,%.3f,%.3f) aim=(%.3f,%.3f) errorPYR=(%.3f,%.3f,%.3f) ratePYR=(%.3f,%.3f,%.3f) wantedPYR=(%.3f,%.3f,%.3f) stopPYR=(%.3f,%.3f,%.3f) brakePYR=(%.3f,%.3f,%.3f) proposedPYR=(%.4f,%.4f,%.4f) turn=%.3f accelPYR=(%.3f,%.3f,%.3f) couplingPY=(%.3f,%.3f) bankDemand=%.3f bankTargetRate=%.3f predictedRollRate=%.3f",
-            config.controller_mode,dt,dx,dy,keys,!manual,pose_pitch.load(),pose_yaw.load(),pose_roll.load(),target_pitch.load(),target_yaw.load(),
-            guidance.pitch_error,guidance.yaw_error,roll_error,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
-            guidance.pitch_arrival.wanted,guidance.yaw_arrival.wanted,guidance.roll_arrival.wanted,
-            guidance.pitch_arrival.stop_distance,guidance.yaw_arrival.stop_distance,guidance.roll_arrival.stop_distance,
-            guidance.pitch_arrival.brake,guidance.yaw_arrival.brake,guidance.roll_arrival.brake,pcmd,ycmd,rcmd,guidance.turn_weight,
-            guidance.pitch_arrival.acceleration,guidance.yaw_arrival.acceleration,guidance.roll_arrival.acceleration,
-            guidance.pitch_coupling,guidance.yaw_coupling,guidance.bank_demand,guidance.bank_target_rate,guidance.predicted_roll_rate);
-    }
-    if(now-telemetry_tick>=10000) {
+    if(now-telemetry_tick >= (config.diagnostics ? 50ull : 10000ull)) {
         telemetry_tick=now;
-        log_line("0.2.35 mode=%d localScaled=(%.3f,%.3f) angle=%.1f roll=%.1f rollErrorDeg=%.3f bodyrate=(%.1f,%.1f,%.1f) cmd=(%.2f,%.2f,%.2f) turnWeight=%.3f leadScale=%.3f",
-          config.controller_mode,p,y,angle,pose_roll.load(),roll_error,filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
-          command_pitch.load(),command_yaw.load(),command_roll.load(),config.controller_mode?guidance.turn_weight:roll_blend,guidance.lead_scale);
+        if(response.angle_control) {
+            log_line("ANGLE_GUIDANCE version=%s controller=angle mode=%s pose=(%.2f,%.2f,%.2f) target=(%.2f,%.2f) angle=%.2f bank=%.2f desiredBank=%.2f errors=(%.2f,%.2f,%.2f) predicted=(%.2f,%.2f,%.2f) raw=(%.3f,%.3f,%.3f) rates=(%.2f,%.2f,%.2f) cmd=(%.3f,%.3f,%.3f) manual=(%d,%d,%d) turnGate=%.3f inputScale=%.3f allocationBlend=%.3f rollAdvance=%.2f highGRequested=%d bankRate=%.2f rollDrift=%.2f rearTurnSign=%d foreground=%d freeLook=%d rollActivity=%.3f brakeWeight=%.3f pitchBrake=%.3f pitchPriority=%.3f highGSettling=%d rolloutEnabled=%d turnBank=%.2f rollBank=%.2f rolloutPhase=%d rolloutReason=%d noseSpeed=%.2f rolloutWait=%.3f basePitch=%.3f terminalPitch=%.3f rollResidual=%.2f terminalActive=%d terminalFade=%.2f",
+                AC8_MOUSE_AIM_VERSION,bank.diving?"dive":"normal",pose_pitch.load(),pose_yaw.load(),pose_roll.load(),
+                target_pitch.load(),target_yaw.load(),angle,bank.current,bank.target,
+                angular_turn.pitch.error,angular_turn.yaw.error,angular_roll.error,
+                angular_turn.pitch.predicted,angular_turn.yaw.predicted,angular_roll.predicted,
+                angular_turn.pitch.raw,angular_turn.yaw.raw,angular_roll.raw,
+                filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
+                command_pitch.load(),command_yaw.load(),command_roll.load(),manual_axes.pitch,manual_axes.yaw,manual_axes.roll,
+                angular_turn.gate,angular_turn.scale,angular_turn.allocation,angular_turn.advance,response.high_g_requested,
+                filtered_roll_rate+roll_drift,roll_drift,bank.rear_turn_sign,!manual,looking,
+                bank.roll_activity,angular_turn.brake_weight,angular_turn.pitch_lookahead,angular_turn.pitch_priority,response.high_g_settling,
+                response.rollout_coordination,bank.target,rollout.bank.target,int(rollout.phase),int(rollout.reason),rollout.nose_speed,rollout.wait_time,angular_turn.pitch.command,pcmd,rollout.residual_speed,terminal_braking.active(),terminal_braking.fade_speed);
+        } else {
+        log_line("GUIDANCE version=%s mode=%s pose=(%.2f,%.2f,%.2f) target=(%.2f,%.2f) angle=%.2f bank=%.2f desiredBank=%.2f rollError=%.2f rates=(%.2f,%.2f,%.2f) cmd=(%.3f,%.3f,%.3f) manual=(%d,%d,%d) foreground=%d freeLook=%d turnActive=%d turnGate=%.3f rateScale=%.3f rollAdvance=%.2f allocationBlend=%.3f highGRequested=%d bankRate=%.2f rollDrift=%.2f wantedHV=(%.2f,%.2f) wantedPY=(%.2f,%.2f) mouse=(%ld,%ld) camera=(%.2f,%.2f,%.2f) rearTurnSign=%d yawBoost=%.3f",
+            AC8_MOUSE_AIM_VERSION,bank.diving?"dive":"normal",pose_pitch.load(),pose_yaw.load(),pose_roll.load(),
+            target_pitch.load(),target_yaw.load(),angle,bank.current,bank.target,bank.error,
+            filtered_pitch_rate,filtered_yaw_rate,filtered_roll_rate,
+            command_pitch.load(),command_yaw.load(),command_roll.load(),manual_axes.pitch,manual_axes.yaw,manual_axes.roll,!manual,looking,
+            !bank.diving,turn.roll_gate,turn.rate_scale,turn.roll_advance,turn.allocation_blend,response.high_g_requested,filtered_roll_rate+roll_drift,roll_drift,turn.horizontal_rate,turn.vertical_rate,turn.pitch_rate,turn.yaw_rate,
+            frame_dx,frame_dy,camera_pitch.load(),camera_yaw.load(),camera_roll.load(),bank.rear_turn_sign,turn.yaw_boost);
+        }
     }
 }
 #include "native_camera.h"
@@ -434,7 +568,7 @@ void release_controls() {
     active.store(false); aircraft.store(0);
     command_pitch.store(0); command_yaw.store(0); command_roll.store(0);
     mouse_dx.store(0); mouse_dy.store(0);
-    previous_pose_tick=0; free_look.reset();
+    previous_pose_tick=0; free_look.reset(); rollout_coordinator.reset(); terminal_braking.reset();
     receive_camera(0,0,0,0,0);
 }
 
@@ -488,7 +622,7 @@ void draw_overlay(HWND window, HDC dc, const RECT& rect, uint32_t* pixels) {
         SetBkMode(dc,TRANSPARENT);
         SetTextColor(dc,RGB(245,245,245));
         char label[160]{};
-        snprintf(label,sizeof(label),"MouseFlight 0.2.35 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
+        snprintf(label,sizeof(label),"MouseFlight 0.2.30 POST-CAMERA %s | aim %.1f / %.1f | camera %.1f / %.1f",
             active.load() && enabled.load()?"ON":"STANDBY",
             target_pitch.load(),target_yaw.load(),camera_pitch.load(),camera_yaw.load());
         TextOutA(dc,28,40,label,static_cast<int>(strlen(label)));
@@ -749,9 +883,8 @@ uintptr_t __fastcall process_input(unsigned char* state, unsigned char* context)
     // Manual pitch also suspends automatic roll, matching MouseFlight maneuvers.
     // Preserve AC's native keyboard values, including opposing-key handling.
     auto held=[](int key) { return (GetAsyncKeyState(key)&0x8000)!=0; };
-    const bool keyboard_pitch=held('W') || held('S');
-    const bool keyboard_roll=keyboard_pitch || held('A') || held('D');
-    const bool keyboard_yaw=held('Q') || held('E');
+    const auto manual=input::manual_axes(key_bindings,held);
+    const bool keyboard_pitch=manual.pitch, keyboard_roll=manual.roll, keyboard_yaw=manual.yaw;
     bool override_input = true; // Lifecycle/foreground already checked above.
     if (override_input && reinterpret_cast<uintptr_t>(state) == pawn + 0x22a0) {
         __try {
@@ -828,6 +961,21 @@ bool bridge_verified=false;
 DWORD bridge_thread=0;
 std::atomic<bool> reload_requested{false};
 bool on_bridge_thread() { return bridge_thread && bridge_thread==GetCurrentThreadId(); }
+mouse_target::Context target_selection_context() {
+    mouse_target::Context result;
+    if(!on_bridge_thread()) return result;
+    result.enabled=config.mouse_target_priority;
+    if(!result.enabled) return result;
+    result.pawn=aircraft.load(); result.diagnostics=config.diagnostics;
+    result.usable=running.load()&&active.load()&&enabled.load()&&!game_paused.load()&&!gaze_active.load()&&
+        result.pawn&&GetTickCount64()-pose_tick.load()<=250&&foreground_is_game()&&
+        !(GetAsyncKeyState(key_bindings[input::FreeLook])&0x8000);
+    if(result.usable) {
+        const auto aim=flight::basis(target_pitch.load(),target_yaw.load(),0).f;
+        result.aim={aim.x,aim.y,aim.z};
+    }
+    return result;
+}
 } // namespace
 
 extern "C" __declspec(dllexport) int ac8_mouseaim_start(lua_State* state) {
@@ -841,7 +989,7 @@ extern "C" __declspec(dllexport) int ac8_mouseaim_start(lua_State* state) {
     LuaView lua(state);
     double handshake[2]{};
     if(!read_numbers(lua,handshake) || handshake[0]!=1729 || handshake[1]!=0.125) return 0;
-    if(running.load()) { lua.set_number(30); return 1; }
+    if(running.load()) { lua.set_number(AC8_MOUSE_AIM_BRIDGE); return 1; }
     if (!offline_authorized()) {
         log_line("inactive: offline launch marker missing; multiplayer-safe refusal");
         return 0;
@@ -849,6 +997,7 @@ extern "C" __declspec(dllexport) int ac8_mouseaim_start(lua_State* state) {
     load_config();
     if (!prepare_hook()) return 0;
     install_native_camera();
+    mouse_target::install(target_selection_context,log_line);
     if (prepare_raw_input_capture()) {
         log_line("mouse capture attached to AC8 raw input");
     } else {
@@ -857,14 +1006,27 @@ extern "C" __declspec(dllexport) int ac8_mouseaim_start(lua_State* state) {
     running.store(true);
     std::thread(mouse_loop).detach();
     std::thread(overlay_loop).detach();
-    log_line("ready: F8 toggle, F9 recenter; RMB reserved for game actions");
-    log_line("0.2.35 lateral-demand capture and moving-bank roll tracking; F11 captures 20s");
-    lua.set_number(30);
+    log_line("ready: local fork %s (upstream 0.2.30); configurable keyboard; see KEYS log",AC8_MOUSE_AIM_VERSION);
+    lua.set_number(AC8_MOUSE_AIM_BRIDGE);
     return 1;
 }
 
+extern "C" __declspec(dllexport) int ac8_mouseaim_keys(lua_State* state) {
+    if (!running.load() || !bridge_verified) return 0;
+    LuaView lua(state);
+    lua.set_number(key_bindings[input::Reload]);
+    lua.set_number(key_bindings[input::GazeProbe]);
+    lua.set_number(key_bindings[input::Perf]);
+    return 3;
+}
+
+extern "C" __declspec(dllexport) int ac8_mouseaim_foreground(lua_State* state) {
+    if (!running.load() || !bridge_verified) return 0;
+    LuaView lua(state); lua.set_number(foreground_is_game()?1:0); return 1;
+}
+
 extern "C" __declspec(dllexport) int ac8_mouseaim_reload(void*) {
-    reload_requested.store(true);
+    if (running.load() && foreground_is_game()) reload_requested.store(true);
     return 0;
 }
 
@@ -921,7 +1083,7 @@ extern "C" __declspec(dllexport) int ac8_mouseaim_release(void*) {
 }
 
 extern "C" __declspec(dllexport) int ac8_mouseaim_perf(void*) {
-    if(running.load()) {
+    if(running.load() && foreground_is_game()) {
         const bool enabled_now=!perf_enabled.load(); perf_enabled.store(enabled_now);
         if(!enabled_now) perf_flush.store(true);
         log_line("PERF capture %s (10-second summaries, no per-frame disk writes)",enabled_now?"ON":"OFF");

@@ -1,0 +1,12 @@
+/build/
+/.venv/
+__pycache__/
+*.py[cod]
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+.env
+.env.*

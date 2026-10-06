@@ -113,7 +113,7 @@ foreach ($file in Get-ChildItem -LiteralPath $modSource -Recurse -File) {
     if ((Get-FileHash -LiteralPath $file.FullName).Hash -ne (Get-FileHash -LiteralPath (Join-Path $mod $relative)).Hash) { throw "Mod verification failed: $relative" }
 }
 if ((Get-FileHash -LiteralPath $core).Hash -ne $coreHash) { throw 'Runtime verification failed.' }
-Write-Host 'VERIFIED: AC8MouseAim 0.2.30 coexist installer r1.' -ForegroundColor Green
+Write-Host 'VERIFIED: AC8MouseAim 0.2.30-pw.11 (contribution build), coexist installer r1.' -ForegroundColor Green
 if ($reuse) {
     Write-Host 'Reused compatible UE4SS. Loader, framework settings, backends and other mod folders were not overwritten.'
     Write-Host 'Your existing loader must already work; disabled or custom loaders were NOT enabled or repaired.'

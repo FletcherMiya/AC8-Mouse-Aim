@@ -1,0 +1,2 @@
+# Windows x64, CPython 3.13. Revisit the lock explicitly for another platform.
+lupa==2.8 --hash=sha256:ce9404c661dbac65cc9bed351ad45e797af93d30d70be309a3fa8209ac86d93b
